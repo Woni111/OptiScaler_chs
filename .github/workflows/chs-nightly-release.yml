@@ -1,0 +1,524 @@
+name: CHS Localized Release
+
+on:
+  schedule:
+    # Poll regularly because upstream nightly GitHub Actions frequently start late.
+    - cron: '23 */2 * * *'
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: '发布通道'
+        type: choice
+        options: [auto, nightly, stable]
+        default: auto
+      upstream_tag:
+        description: '指定上游 tag（留空则使用该通道最新版）'
+        type: string
+        required: false
+        default: ''
+      force_republish:
+        description: '即使当前 tag 已发布，也创建一次新的重构建版本'
+        type: boolean
+        default: false
+
+concurrency:
+  group: chs-localized-release-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: optiscaler/OptiScaler
+  NIGHTLY_REPO: optiscaler/OptiScaler-nightly
+  MINE: ${{ github.repository }}
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  prepare:
+    name: Detect and synchronize upstream
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.target.outputs.should_release }}
+      upstream_channel: ${{ steps.target.outputs.upstream_channel }}
+      upstream_tag: ${{ steps.target.outputs.upstream_tag }}
+      upstream_release_id: ${{ steps.target.outputs.upstream_release_id }}
+      upstream_published_at: ${{ steps.target.outputs.upstream_published_at }}
+      source_sha: ${{ steps.target.outputs.source_sha }}
+      local_tag: ${{ steps.target.outputs.local_tag }}
+      release_title: ${{ steps.target.outputs.release_title }}
+      prerelease: ${{ steps.target.outputs.prerelease }}
+      translation_status: ${{ steps.sync.outputs.translation_status }}
+      docs_status: ${{ steps.sync.outputs.docs_status }}
+    steps:
+      - name: Checkout localization fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve upstream release and source commit
+        id: target
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_CHANNEL: ${{ github.event.inputs.channel || 'auto' }}
+          INPUT_TAG: ${{ github.event.inputs.upstream_tag || '' }}
+          FORCE_REPUBLISH: ${{ github.event.inputs.force_republish || 'false' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_exists() {
+            gh release view "$1" --repo "$MINE" >/dev/null 2>&1
+          }
+
+          stable_json=$(gh api "repos/$UPSTREAM_REPO/releases/latest" 2>/dev/null || true)
+          if [ -z "$stable_json" ]; then
+            stable_json='{}'
+          fi
+          stable_tag=$(printf '%s' "$stable_json" | jq -r '.tag_name // empty')
+          stable_published=$(printf '%s' "$stable_json" | jq -r '.published_at // empty')
+
+          nightly_json=$(gh api "repos/$NIGHTLY_REPO/releases?per_page=20")
+          nightly_tag=$(printf '%s' "$nightly_json" | jq -r '
+            map(select(.draft == false and .prerelease == true))
+            | sort_by(.published_at)
+            | reverse
+            | .[0].tag_name // empty
+          ')
+
+          echo "Stable: ${stable_tag:-none}"
+          echo "Nightly: ${nightly_tag:-none}"
+
+          channel=""
+          tag=""
+
+          if [ -n "$INPUT_TAG" ]; then
+            if printf '%s' "$nightly_json" | jq -e --arg tag "$INPUT_TAG" \
+              '.[] | select(.tag_name == $tag)' >/dev/null; then
+              channel="nightly"
+            elif gh api "repos/$UPSTREAM_REPO/releases/tags/$INPUT_TAG" >/dev/null 2>&1; then
+              channel="stable"
+            else
+              echo "::error::找不到上游 Release tag: $INPUT_TAG"
+              exit 1
+            fi
+            tag="$INPUT_TAG"
+          elif [ "$INPUT_CHANNEL" = "stable" ]; then
+            channel="stable"
+            tag="$stable_tag"
+          elif [ "$INPUT_CHANNEL" = "nightly" ]; then
+            channel="nightly"
+            tag="$nightly_tag"
+          else
+            stable_missing=false
+            nightly_missing=false
+            if [ -n "$stable_tag" ] && ! release_exists "${stable_tag}-chs"; then
+              stable_missing=true
+            fi
+            if [ -n "$nightly_tag" ] && ! release_exists "${nightly_tag}-chs"; then
+              nightly_missing=true
+            fi
+
+            # Auto mode follows whichever upstream release is newer. This catches
+            # daily nightly builds while still publishing official stable releases.
+            if [ "$stable_missing" = true ] && [ "$nightly_missing" = true ]; then
+              stable_ts=$(date -d "$stable_published" +%s)
+              nightly_ts=$(date -d "$(printf '%s' "$nightly_json" | jq -r '
+                map(select(.draft == false and .prerelease == true))
+                | sort_by(.published_at)
+                | reverse
+                | .[0].published_at
+              ')" +%s)
+              if [ "$nightly_ts" -ge "$stable_ts" ]; then
+                channel="nightly"
+                tag="$nightly_tag"
+              else
+                channel="stable"
+                tag="$stable_tag"
+              fi
+            elif [ "$nightly_missing" = true ]; then
+              channel="nightly"
+              tag="$nightly_tag"
+            elif [ "$stable_missing" = true ]; then
+              channel="stable"
+              tag="$stable_tag"
+            fi
+
+            if [ -z "$tag" ] && [ "$FORCE_REPUBLISH" = "true" ]; then
+              if [ -n "$stable_tag" ] && [ -n "$nightly_tag" ]; then
+                stable_ts=$(date -d "$stable_published" +%s)
+                nightly_ts=$(date -d "$(printf '%s' "$nightly_json" | jq -r '
+                  map(select(.draft == false and .prerelease == true))
+                  | sort_by(.published_at)
+                  | reverse
+                  | .[0].published_at
+                ')" +%s)
+                if [ "$nightly_ts" -ge "$stable_ts" ]; then
+                  channel="nightly"
+                  tag="$nightly_tag"
+                else
+                  channel="stable"
+                  tag="$stable_tag"
+                fi
+              fi
+            fi
+          fi
+
+          if [ -z "$tag" ]; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "reason=No unreleased upstream version" >> "$GITHUB_OUTPUT"
+            echo "没有尚未汉化的上游版本，跳过。"
+            exit 0
+          fi
+
+          if [ "$channel" = "nightly" ]; then
+            source_repo="$NIGHTLY_REPO"
+            prerelease=true
+          else
+            source_repo="$UPSTREAM_REPO"
+            prerelease=false
+          fi
+
+          release_json=$(gh api "repos/$source_repo/releases/tags/$tag")
+          release_id=$(printf '%s' "$release_json" | jq -r '.id')
+          published_at=$(printf '%s' "$release_json" | jq -r '.published_at')
+          release_body=$(printf '%s' "$release_json" | jq -r '.body // ""')
+
+          base_local_tag="${tag}-chs"
+          local_tag="$base_local_tag"
+          if [ "$FORCE_REPUBLISH" != "true" ] && release_exists "$local_tag"; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "reason=$tag is already localized" >> "$GITHUB_OUTPUT"
+            echo "$tag 已汉化发布，跳过。"
+            exit 0
+          fi
+          if [ "$FORCE_REPUBLISH" = "true" ]; then
+            n=2
+            while release_exists "$local_tag"; do
+              local_tag="${base_local_tag}-r${n}"
+              n=$((n + 1))
+            done
+          fi
+
+          if [ "$channel" = "stable" ]; then
+            source_sha=$(gh api "repos/$UPSTREAM_REPO/commits/$tag" --jq '.sha')
+            display_version="$tag"
+            release_title="OptiScaler ${tag} 汉化版"
+          else
+            # The nightly repository builds optiscaler/OptiScaler and its release
+            # body lists the built source commits newest-first. The first full SHA
+            # pins this localization to the same source revision.
+            source_sha=$(printf '%s' "$release_body" \
+              | grep -oE 'https://github\.com/optiscaler/OptiScaler/commit/[0-9a-f]{40}' \
+              | head -n 1 | awk -F/ '{print $NF}' || true)
+            if [ -z "$source_sha" ]; then
+              # Nightly releases can say "No changes in the last 24 hours".
+              # In that case use upstream HEAD as of release publication.
+              source_sha=$(gh api "repos/$UPSTREAM_REPO/commits?until=$published_at&per_page=1" --jq '.[0].sha')
+            fi
+            display_version=$(echo "$tag" | sed -E 's/^nightly-([0-9]{4})([0-9]{2})([0-9]{2})(-.*)?$/\1-\2-\3\4/')
+            release_title="Nightly ${display_version} 汉化版"
+          fi
+
+          if ! printf '%s' "$source_sha" | grep -qE '^[0-9a-f]{40}$'; then
+            echo "::error::无法解析上游源码提交: $source_sha"
+            exit 1
+          fi
+          gh api "repos/$UPSTREAM_REPO/commits/$source_sha" >/dev/null
+
+          echo "Release: $tag -> $local_tag"
+          echo "Source:  $source_sha"
+
+          {
+            echo "should_release=true"
+            echo "upstream_channel=$channel"
+            echo "upstream_tag=$tag"
+            echo "upstream_release_id=$release_id"
+            echo "upstream_published_at=$published_at"
+            echo "source_sha=$source_sha"
+            echo "local_tag=$local_tag"
+            echo "release_title=$release_title"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout-by-source and translate additions
+        id: sync
+        if: steps.target.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          UPSTREAM_TAG: ${{ steps.target.outputs.upstream_tag }}
+          UPSTREAM_CHANNEL: ${{ steps.target.outputs.upstream_channel }}
+          SOURCE_SHA: ${{ steps.target.outputs.source_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "Woni111"
+          git config user.email "Woni111@users.noreply.github.com"
+          git remote add upstream "https://github.com/$UPSTREAM_REPO.git" 2>/dev/null || true
+
+          # Keep an upstream/master ref for the document synchronization helpers,
+          # then fetch the exact source commit used by this upstream release.
+          git fetch upstream master --depth 100
+          if ! git fetch upstream "$SOURCE_SHA" --depth 1 2>/dev/null; then
+            git fetch upstream master --depth 500
+          fi
+          git cat-file -e "${SOURCE_SHA}^{commit}"
+
+          CORE_PATHS=(
+            OptiScaler external images
+            OptiScaler.sln Changelog.md LICENSE setup_linux.sh
+            .clang-format .gitattributes .gitignore .gitmodules
+          )
+          for path in "${CORE_PATHS[@]}"; do
+            if git cat-file -e "$SOURCE_SHA:$path" 2>/dev/null; then
+              git checkout "$SOURCE_SHA" -- "$path"
+            fi
+          done
+          for path in run overlay_dev binaries; do
+            if git cat-file -e "$SOURCE_SHA:$path" 2>/dev/null; then
+              git checkout "$SOURCE_SHA" -- "$path"
+            fi
+          done
+
+          python scripts/scan_strings.py "$GITHUB_WORKSPACE" --output pending.json || true
+          pending_count=$(python -c "import json; print(len(json.load(open('pending.json'))))" 2>/dev/null || echo 0)
+          echo "新增待翻译字符串: $pending_count"
+
+          translation_status="none"
+          if [ "${pending_count:-0}" -gt 0 ]; then
+            if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
+              translation_status="pending-no-api-key:$pending_count"
+              echo "::warning::有 $pending_count 条新增字符串，但未配置 DEEPSEEK_API_KEY，发布包将回退英文。"
+            else
+              set +e
+              python scripts/translate.py --input pending.json
+              translate_code=$?
+              set -e
+              if [ "$translate_code" -eq 0 ]; then
+                translation_status="translated:$pending_count"
+              else
+                translation_status="failed:$pending_count"
+                echo "::warning::自动翻译失败，保留已有翻译映射并继续构建。"
+              fi
+            fi
+          fi
+
+          docs_status="none"
+          set +e
+          python scripts/sync_docs.py --repo "$GITHUB_WORKSPACE" --api-key "${DEEPSEEK_API_KEY:-}"
+          docs_code=$?
+          set -e
+          case "$docs_code" in
+            0) docs_status="unchanged" ;;
+            2) docs_status="updated" ;;
+            *) docs_status="warning:$docs_code"; echo "::warning::文档同步返回 $docs_code，继续构建。" ;;
+          esac
+
+          set +e
+          python scripts/translate_setup_bat.py --repo "$GITHUB_WORKSPACE"
+          bat_code=$?
+          set -e
+          if [ "$bat_code" -ne 0 ] && [ "$bat_code" -ne 2 ]; then
+            echo "::warning::setup_windows.bat 同步返回 $bat_code，继续构建。"
+          fi
+
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: localize upstream ${UPSTREAM_TAG} [skip ci]"
+            git push origin HEAD:master
+            echo "已提交上游源码、文档和翻译更新。"
+          else
+            echo "上游源码和翻译资产无文件变化，直接构建当前 master。"
+          fi
+
+          {
+            echo "translation_status=$translation_status"
+            echo "docs_status=$docs_status"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build Chinese package
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout latest synchronized master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Inject localization
+        shell: pwsh
+        run: python scripts/apply_patch.py "$env:GITHUB_WORKSPACE"
+
+      - name: Verify localization tables
+        shell: pwsh
+        run: python scripts/verify.py "$env:GITHUB_WORKSPACE"
+
+      - name: Build
+        shell: pwsh
+        run: >-
+          ./scripts/build.ps1
+          -SourceDir "$env:GITHUB_WORKSPACE"
+          -OutDir "$env:GITHUB_WORKSPACE/dist/CHS"
+
+      - name: Bundle current optional components
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dist = Join-Path $env:GITHUB_WORKSPACE "dist/CHS"
+          $download = Join-Path $env:GITHUB_WORKSPACE "dist/dlssg-download"
+          $extract = Join-Path $env:GITHUB_WORKSPACE "dist/dlssg-extracted"
+          New-Item -ItemType Directory -Path $download -Force | Out-Null
+
+          gh release download --repo optiscaler/dlssg-to-fsr3 --pattern "*.zip" --dir $download --clobber
+          $zip = Get-ChildItem -Path $download -Filter "*.zip" | Select-Object -First 1
+          if (-not $zip) { throw "dlssg-to-fsr3 release has no zip asset" }
+          Expand-Archive -Path $zip.FullName -DestinationPath $extract -Force
+          $dll = Get-ChildItem -Path $extract -Filter "dlssg_to_fsr3_amd_is_better.dll" -Recurse | Select-Object -First 1
+          if (-not $dll) { throw "dlssg_to_fsr3_amd_is_better.dll not found in archive" }
+          Copy-Item $dll.FullName (Join-Path $dist "dlssg_to_fsr3_amd_is_better.dll") -Force
+
+          $fetcher = Join-Path $env:GITHUB_WORKSPACE "Streamlined_fetcher_windows.bat"
+          if (Test-Path $fetcher) {
+            Copy-Item $fetcher (Join-Path $dist "Streamlined_fetcher_windows.bat") -Force
+          }
+
+      - name: Validate package contents
+        shell: pwsh
+        run: |
+          $dist = Join-Path $env:GITHUB_WORKSPACE "dist/CHS"
+          $required = @(
+            "OptiScaler.dll",
+            "OptiScaler.ini",
+            "font/wqy-microhei.ttc",
+            "dlssg_to_fsr3_amd_is_better.dll"
+          )
+          foreach ($item in $required) {
+            $path = Join-Path $dist $item
+            if (-not (Test-Path $path)) { throw "Missing required package file: $item" }
+          }
+          if (-not (Get-ChildItem (Join-Path $dist "plugins") -Filter "OptiPatcher*.asi" -ErrorAction SilentlyContinue)) {
+            throw "OptiPatcher plugin was not bundled"
+          }
+          Get-ChildItem $dist -Recurse -File | Measure-Object -Property Length -Sum |
+            Select-Object Count, Sum | Format-List
+
+      - name: Create archive, checksum and metadata
+        shell: pwsh
+        env:
+          UPSTREAM_TAG: ${{ needs.prepare.outputs.upstream_tag }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          LOCAL_TAG: ${{ needs.prepare.outputs.local_tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dist = Join-Path $env:GITHUB_WORKSPACE "dist/CHS"
+          $assetBase = "OptiScaler_CHS_$env:UPSTREAM_TAG"
+          $archive = Join-Path $env:GITHUB_WORKSPACE "dist/$assetBase.7z"
+
+          Push-Location $dist
+          try {
+            & 7z a -t7z -mx=9 $archive "*"
+            if ($LASTEXITCODE -ne 0) { throw "7z failed with exit code $LASTEXITCODE" }
+          } finally {
+            Pop-Location
+          }
+
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $assetBase.7z" | Set-Content -Path "$archive.sha256" -Encoding utf8NoBOM
+
+          $metadata = [ordered]@{
+            schema = 1
+            localized_release = $env:LOCAL_TAG
+            upstream_release = $env:UPSTREAM_TAG
+            upstream_source_commit = $env:SOURCE_SHA
+            built_at_utc = (Get-Date).ToUniversalTime().ToString("o")
+            workflow_run = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          }
+          $metadata | ConvertTo-Json | Set-Content -Path (Join-Path $env:GITHUB_WORKSPACE "dist/upstream-metadata.json") -Encoding utf8NoBOM
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: chs-release
+          path: |
+            dist/*.7z
+            dist/*.sha256
+            dist/upstream-metadata.json
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish localized release
+    needs: [prepare, build]
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: chs-release
+          path: dist
+
+      - name: Compose release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_CHANNEL: ${{ needs.prepare.outputs.upstream_channel }}
+          UPSTREAM_TAG: ${{ needs.prepare.outputs.upstream_tag }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          TRANSLATION_STATUS: ${{ needs.prepare.outputs.translation_status }}
+          DOCS_STATUS: ${{ needs.prepare.outputs.docs_status }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$UPSTREAM_CHANNEL" = "nightly" ]; then
+            upstream_repo="$NIGHTLY_REPO"
+          else
+            upstream_repo="$UPSTREAM_REPO"
+          fi
+
+          {
+            echo "# OptiScaler 中文汉化版"
+            echo
+            echo "- 上游 Release: \`$UPSTREAM_TAG\`"
+            echo "- 固定源码提交: [\`${SOURCE_SHA:0:10}\`](https://github.com/$UPSTREAM_REPO/commit/$SOURCE_SHA)"
+            echo "- 翻译状态: \`$TRANSLATION_STATUS\`"
+            echo "- 文档同步状态: \`$DOCS_STATUS\`"
+            echo
+            echo "## 上游更新"
+            echo
+            gh api "repos/$upstream_repo/releases/tags/$UPSTREAM_TAG" --jq '.body // "无更新说明"'
+            echo
+            echo "---"
+            echo "本 Release 由 GitHub Actions 自动构建；源码与上游 Release 对应提交固定，避免串入后续版本。"
+          } > release-notes.md
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LOCAL_TAG: ${{ needs.prepare.outputs.local_tag }}
+          TITLE: ${{ needs.prepare.outputs.release_title }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$LOCAL_TAG" \
+            dist/*.7z dist/*.sha256 dist/upstream-metadata.json \
+            --repo "$MINE" \
+            --title "$TITLE" \
+            --notes-file release-notes.md \
+            --prerelease="$PRERELEASE"
+          gh release view "$LOCAL_TAG" --repo "$MINE" \
+            --json url,tagName,name,isPrerelease,assets

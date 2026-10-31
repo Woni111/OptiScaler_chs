@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
-"""验证：localization.h enum 数 == lang_en.h == lang_zh_cn.h 条目数"""
-import io, re, sys
+"""验证汉化表与源码中的 LOC key 保持一致。"""
 import io
-import json
 import os
 import re
 import sys
@@ -15,7 +13,7 @@ else:
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
 
-repo = r'C:\Users\Yang\.openclaw\workspace\projects\optiscaler-chs-repo'
+repo = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.getcwd()
 loc = io.open(repo + r'\overlay\OptiScaler\localization\localization.h', encoding='utf-8').read()
 en = io.open(repo + r'\overlay\OptiScaler\localization\lang_en.h', encoding='utf-8').read()
 zh = io.open(repo + r'\overlay\OptiScaler\localization\lang_zh_cn.h', encoding='utf-8').read()
@@ -34,8 +32,8 @@ print(f'lang_en 条目: {len(en_keys)}')
 print(f'lang_zh 条目: {len(zh_keys)}')
 
 # enum 里有但翻译表没有的
-missing_en = enum_names - en_keys - {'COUNT'}
-missing_zh = enum_names - zh_keys - {'COUNT'}
+missing_en = enum_names - en_keys - lang_members
+missing_zh = enum_names - zh_keys - lang_members
 extra_en = en_keys - enum_names
 extra_zh = zh_keys - enum_names
 
@@ -49,3 +47,22 @@ mc = io.open(repo + r'\OptiScaler\menu\menu_common.cpp', encoding='utf-8').read(
 used = set(re.findall(r'LOC\((\w+)\)', mc))
 missing_used = used - enum_names
 print(f'\nmenu_common.cpp 使用 {len(used)} 个 LOC key，缺失: {sorted(missing_used)[:20]}')
+
+failed = False
+for label, missing in (
+    ('lang_en', missing_en),
+    ('lang_zh', missing_zh),
+    ('menu_common.cpp', missing_used),
+):
+    if missing:
+        print(f'::error::{label} 缺失 {len(missing)} 个 key', file=sys.stderr)
+        failed = True
+for label, extra in (('lang_en', extra_en), ('lang_zh', extra_zh)):
+    if extra:
+        print(f'::error::{label} 存在 {len(extra)} 个未知 key', file=sys.stderr)
+        failed = True
+
+if failed:
+    sys.exit(1)
+
+print('\n汉化表验证通过。')

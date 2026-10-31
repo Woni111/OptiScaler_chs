@@ -24,8 +24,8 @@
 <br />
 <div align="center">
   <a href="https://discord.gg/wEyd9w4hG5"><img src="https://img.shields.io/badge/OptiScaler-blue?style=for-the-badge&logo=discord&logoColor=white&logoSize=auto&color=5865F2" alt="Discord invite"></a>
-  <a href="https://github.com/deYangar/OptiScaler_chs/releases/latest"><img src="https://img.shields.io/badge/Download-Stable-green?style=for-the-badge&logo=github&logoSize=auto" alt="Stable release"></a>
-  <a href="https://github.com/deYangar/OptiScaler_chs/releases/tag/nightly"><img src="https://img.shields.io/badge/Download-Nightly-purple?style=for-the-badge&logo=github&logoSize=auto" alt="Nightly release"></a>
+  <a href="https://github.com/Woni111/OptiScaler_chs/releases?q=-chs"><img src="https://img.shields.io/badge/Download-Stable-green?style=for-the-badge&logo=github&logoSize=auto" alt="Stable release"></a>
+  <a href="https://github.com/Woni111/OptiScaler_chs/releases?q=nightly"><img src="https://img.shields.io/badge/Download-Nightly-purple?style=for-the-badge&logo=github&logoSize=auto" alt="Nightly release"></a>
   <a href="https://github.com/optiscaler/OptiScaler/wiki"><img src="https://img.shields.io/badge/Documentation-blue?style=for-the-badge&logo=gitbook&logoColor=white&logoSize=auto" alt="Wiki"></a>
 </div>
 
@@ -51,8 +51,9 @@
 
 | | |
 |:---|---:|
-| <font size="4">⬆️ **上游**</font> | <font size="4">[optiscaler/OptiScaler](https://github.com/optiscaler/OptiScaler)（原版，英文界面）</font> |
-| <font size="4">🏠 **本仓库**</font> | <font size="4">每日自动同步上游源码 + 自动翻译新增文本 + 自动构建发布</font> |
+| <font size="4">⬆️ **上游源码**</font> | <font size="4">[optiscaler/OptiScaler](https://github.com/optiscaler/OptiScaler)（原版，英文界面）</font> |
+| <font size="4">🌙 **上游 Nightly**</font> | <font size="4">[optiscaler/OptiScaler-nightly](https://github.com/optiscaler/OptiScaler-nightly)（官方每日构建）</font> |
+| <font size="4">🏠 **本仓库**</font> | <font size="4">检测上游 Release + 固定对应源码提交 + 汉化构建 + 自动发布</font> |
 | <font size="4">✅ **完全兼容**</font> | <font size="4">存档、配置文件格式不变，可直接替换 `dxgi.dll` / `nvngx.dll`</font> |
 
 </td>
@@ -60,6 +61,20 @@
 </table>
 
 </div>
+
+---
+
+## 自动发布
+
+本仓库每两小时检查一次 [OptiScaler-nightly](https://github.com/optiscaler/OptiScaler-nightly) 和
+[OptiScaler 正式版](https://github.com/optiscaler/OptiScaler/releases)。发现尚未汉化的新版本后，会自动：
+
+1. 固定该上游 Release 对应的源码提交，不使用可能已经继续前进的 `master`；
+2. 同步源码、汉化资源、INI 和文档，并尝试翻译新增字符串；
+3. 在 Windows runner 上编译、校验、打包并创建 GitHub Release。
+
+汉化 Release 使用 `-chs` 后缀，例如 `nightly-20261030-chs`、`v0.9.4-chs`。
+维护和手动触发说明见 [docs/AUTOMATION.md](docs/AUTOMATION.md)。
 
 ---
 

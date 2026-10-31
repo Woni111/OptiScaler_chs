@@ -105,9 +105,10 @@ def call_deepseek(api_key, texts):
         raise RuntimeError('无 API key')
     prompt = GLOSSARY + '\n请把以下 JSON 数组中的英文内容翻译成简体中文（保留 Markdown/ini 格式、代码块、数值、DLL 文件名、URL、选项值不翻译），输出 JSON 数组，一一对应：\n' + json.dumps(texts, ensure_ascii=False)
     body = json.dumps({
-        "model": "deepseek-v4-flash",
+        "model": "deepseek-flash",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
+        "thinking": {"type": "disabled"},
         "max_tokens": 8192,
     }).encode('utf-8')
     req = urllib.request.Request(
