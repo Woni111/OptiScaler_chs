@@ -16,7 +16,7 @@ translate_setup_bat.py - setup_windows.bat 增量汉化同步工具
 - 未命中的行保留英文原样，并输出警告列表（上游改动新文本时提醒补充映射）
 
 用法：
-  python scripts/translate_setup_bat.py --repo <仓库根> [--dry-run]
+  python scripts/translate_setup_bat.py --repo <仓库根> [--upstream-ref <ref>] [--dry-run]
 
 退出码：0 = 无变更；2 = 有变更（需提交）；其他 = 异常
 """
@@ -37,6 +37,7 @@ from setup_bat_mapping import MAPPING, EXTRA, HEADER
 
 UPSTREAM_REMOTE = 'upstream'
 UPSTREAM_BRANCH = 'master'
+_UPSTREAM_REF = [f'{UPSTREAM_REMOTE}/{UPSTREAM_BRANCH}']
 REF_PATH = 'docs/upstream_ref/setup_windows.bat'
 TARGET_PATH = 'setup_windows.bat'
 
@@ -103,14 +104,21 @@ def translate(upstream_lines):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--repo', required=True)
+    ap.add_argument('--upstream-ref', default=f'{UPSTREAM_REMOTE}/{UPSTREAM_BRANCH}',
+                    help='要读取的上游 git ref，默认 upstream/master')
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--force', action='store_true', help='忽略基线对比，强制重新汉化')
     args = ap.parse_args()
 
     repo = os.path.abspath(args.repo)
+    _UPSTREAM_REF[0] = args.upstream_ref
 
     # 1. 读取上游最新版
-    upstream = run_git(repo, ['show', f'{UPSTREAM_REMOTE}/{UPSTREAM_BRANCH}:setup_windows.bat'])
+    if _UPSTREAM_REF[0] == f'{UPSTREAM_REMOTE}/{UPSTREAM_BRANCH}':
+        run_git(repo, ['fetch', UPSTREAM_REMOTE, UPSTREAM_BRANCH, '--depth', '50'])
+    else:
+        run_git(repo, ['cat-file', '-e', f'{_UPSTREAM_REF[0]}^{{commit}}'])
+    upstream = run_git(repo, ['show', f'{_UPSTREAM_REF[0]}:setup_windows.bat'])
     if upstream is None:
         print('⚠️ 无法读取上游 setup_windows.bat，跳过')
         return 1

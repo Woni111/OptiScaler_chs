@@ -261,7 +261,11 @@ jobs:
           # Keep an upstream/master ref for the document synchronization helpers,
           # then fetch the exact source commit used by this upstream release.
           git fetch upstream master --depth 100
-          if ! git fetch upstream "$SOURCE_SHA" --depth 1 2>/dev/null; then
+          if [ "$UPSTREAM_CHANNEL" = "stable" ]; then
+            git fetch upstream \
+              "refs/tags/${UPSTREAM_TAG}:refs/tags/upstream-${UPSTREAM_TAG}" \
+              --depth 1
+          elif ! git fetch upstream "$SOURCE_SHA" --depth 1 2>/dev/null; then
             git fetch upstream master --depth 500
           fi
           git cat-file -e "${SOURCE_SHA}^{commit}"
@@ -308,7 +312,10 @@ jobs:
 
           docs_status="none"
           set +e
-          python scripts/sync_docs.py --repo "$GITHUB_WORKSPACE" --api-key "${DEEPSEEK_API_KEY:-}"
+          python scripts/sync_docs.py \
+            --repo "$GITHUB_WORKSPACE" \
+            --api-key "${DEEPSEEK_API_KEY:-}" \
+            --upstream-ref "$SOURCE_SHA"
           docs_code=$?
           set -e
           case "$docs_code" in
@@ -318,7 +325,9 @@ jobs:
           esac
 
           set +e
-          python scripts/translate_setup_bat.py --repo "$GITHUB_WORKSPACE"
+          python scripts/translate_setup_bat.py \
+            --repo "$GITHUB_WORKSPACE" \
+            --upstream-ref "$SOURCE_SHA"
           bat_code=$?
           set -e
           if [ "$bat_code" -ne 0 ] && [ "$bat_code" -ne 2 ]; then

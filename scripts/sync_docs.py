@@ -55,6 +55,7 @@ MD_DOCS = {
 INI_DOCS = ['OptiScaler.ini']
 UPSTREAM_REMOTE = 'upstream'
 UPSTREAM_BRANCH = 'master'
+_UPSTREAM_REF = [f'{UPSTREAM_REMOTE}/{UPSTREAM_BRANCH}']
 REF_DIR = 'docs/upstream_ref'
 
 GLOSSARY = """
@@ -94,7 +95,7 @@ def write_file(path, content):
 def get_upstream_file(repo, path):
     """从 upstream remote 读取文件内容（不覆盖工作区）"""
     try:
-        return run_git(repo, ['show', f'{UPSTREAM_REMOTE}/{UPSTREAM_BRANCH}:{path}'])
+        return run_git(repo, ['show', f'{_UPSTREAM_REF[0]}:{path}'])
     except RuntimeError:
         return None
 
@@ -321,9 +322,12 @@ def main():
     parser = argparse.ArgumentParser(description='汉化文档增量同步')
     parser.add_argument('--repo', required=True, help='仓库根目录')
     parser.add_argument('--api-key', default=os.environ.get('DEEPSEEK_API_KEY', ''), help='DeepSeek API key')
+    parser.add_argument('--upstream-ref', default=f'{UPSTREAM_REMOTE}/{UPSTREAM_BRANCH}',
+                        help='要读取的上游 git ref，默认 upstream/master')
     parser.add_argument('--dry-run', action='store_true', help='只检测不写文件')
     args = parser.parse_args()
     _DRY_RUN[0] = args.dry_run
+    _UPSTREAM_REF[0] = args.upstream_ref
 
     repo = os.path.abspath(args.repo)
     load_strings_map(repo)  # 兼容旧参数（保留）
@@ -332,7 +336,10 @@ def main():
     remotes = run_git(repo, ['remote'])
     if UPSTREAM_REMOTE not in remotes.split():
         run_git(repo, ['remote', 'add', UPSTREAM_REMOTE, 'https://github.com/optiscaler/OptiScaler.git'])
-    run_git(repo, ['fetch', UPSTREAM_REMOTE, UPSTREAM_BRANCH, '--depth', '50'])
+    if _UPSTREAM_REF[0] == f'{UPSTREAM_REMOTE}/{UPSTREAM_BRANCH}':
+        run_git(repo, ['fetch', UPSTREAM_REMOTE, UPSTREAM_BRANCH, '--depth', '50'])
+    else:
+        run_git(repo, ['cat-file', '-e', f'{_UPSTREAM_REF[0]}^{{commit}}'])
 
     all_changed = []
     report_lines = []
