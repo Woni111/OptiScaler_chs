@@ -413,9 +413,11 @@ jobs:
             "OptiScaler.dll",
             "OptiScaler.ini",
             "font/wqy-microhei.ttc",
-            "dlssg_to_fsr3_amd_is_better.dll",
-            "Streamlined_fetcher_windows.bat"
+            "dlssg_to_fsr3_amd_is_better.dll"
           )
+          if (Test-Path (Join-Path $env:GITHUB_WORKSPACE "Streamlined_fetcher_windows.bat")) {
+            $required += "Streamlined_fetcher_windows.bat"
+          }
           foreach ($item in $required) {
             $path = Join-Path $dist $item
             if (-not (Test-Path $path)) { throw "Missing required package file: $item" }
