@@ -269,6 +269,7 @@ jobs:
           CORE_PATHS=(
             OptiScaler external images
             OptiScaler.sln Changelog.md LICENSE setup_linux.sh
+            Streamlined_fetcher_windows.bat
             .clang-format .gitattributes .gitignore .gitmodules
           )
           for path in "${CORE_PATHS[@]}"; do
@@ -404,7 +405,8 @@ jobs:
             "OptiScaler.dll",
             "OptiScaler.ini",
             "font/wqy-microhei.ttc",
-            "dlssg_to_fsr3_amd_is_better.dll"
+            "dlssg_to_fsr3_amd_is_better.dll",
+            "Streamlined_fetcher_windows.bat"
           )
           foreach ($item in $required) {
             $path = Join-Path $dist $item
