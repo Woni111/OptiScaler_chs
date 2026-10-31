@@ -270,18 +270,17 @@ jobs:
           fi
           git cat-file -e "${SOURCE_SHA}^{commit}"
 
-          CORE_PATHS=(
+          SOURCE_PATHS=(
             OptiScaler external images
+            run overlay_dev
             OptiScaler.sln Changelog.md LICENSE setup_linux.sh
             Streamlined_fetcher_windows.bat
             .clang-format .gitattributes .gitignore .gitmodules
           )
-          for path in "${CORE_PATHS[@]}"; do
-            if git cat-file -e "$SOURCE_SHA:$path" 2>/dev/null; then
-              git checkout "$SOURCE_SHA" -- "$path"
-            fi
-          done
-          for path in run overlay_dev binaries; do
+          for path in "${SOURCE_PATHS[@]}"; do
+            # Exact checkout: delete stale paths that do not exist in the target
+            # stable/nightly tree before restoring the versioned source snapshot.
+            git rm -r --ignore-unmatch -- "$path" >/dev/null 2>&1 || true
             if git cat-file -e "$SOURCE_SHA:$path" 2>/dev/null; then
               git checkout "$SOURCE_SHA" -- "$path"
             fi
