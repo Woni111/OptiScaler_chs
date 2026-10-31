@@ -1604,4 +1604,24 @@ inline void InitEnglishTable(std::unordered_map<int, const char*>& table) {
     table[static_cast<int>(LK::UI_FFX_Vk_FG)] = "FFX Vk FG";
     table[static_cast<int>(LK::UI_Custom_DLSSG_from_custom_s_dlssg)] = "Custom DLSSG from custom\\%s\\dlssg";
     table[static_cast<int>(LK::UI_Frame_Generation_s)] = "Frame Generation (%s)";
+    table[static_cast<int>(LK::UI_FSR_2_2_1)] = "FSR 2.2.1";
+    table[static_cast<int>(LK::UI_FSR_2_2_1_w_Dx12)] = "FSR 2.2.1 w/Dx12";
+    table[static_cast<int>(LK::UI_FSR_2_1_2_w_Dx12)] = "FSR 2.1.2 w/Dx12";
+    table[static_cast<int>(LK::UI_FSR_3_X)] = "FSR 3.X";
+    table[static_cast<int>(LK::UI_XeSS_w_Dx12)] = "XeSS w/Dx12";
+    table[static_cast<int>(LK::UI_FSR_2_1_2)] = "FSR 2.1.2";
+    table[static_cast<int>(LK::UI_FSR_3_X_w_Dx12)] = "FSR 3.X w/Dx12";
+    table[static_cast<int>(LK::UI_s_FPS_6_1f_5_1f_s)] = "%s | FPS: %6.1f/%5.1f %s";
+    table[static_cast<int>(LK::UI_s_FPS_6_1f_s)] = "%s | FPS: %6.1f %s";
+    table[static_cast<int>(LK::UI_s_FPS_6_1f_5_1f_7_2f_ms_s_s_s_u_u_u)] = "%s | FPS: %6.1f/%5.1f, %7.2f ms %s | %s -> %s %u.%u.%u";
+    table[static_cast<int>(LK::UI_s_FPS_6_1f_7_2f_ms_s_s_s_u_u_u)] = "%s | FPS: %6.1f, %7.2f ms %s | %s -> %s %u.%u.%u";
+    table[static_cast<int>(LK::UI_s_FPS_6_1f_5_1f_7_2f_ms_s)] = "%s | FPS: %6.1f/%5.1f, %7.2f ms %s";
+    table[static_cast<int>(LK::UI_s_FPS_6_1f_7_2f_ms_s)] = "%s | FPS: %6.1f, %7.2f ms %s";
+    table[static_cast<int>(LK::UI_s_FPS_6_1f_5_1f_Avg_6_1f_s_s_s_u_u_u)] = "%s | FPS: %6.1f/%5.1f, Avg: %6.1f %s | %s -> %s %u.%u.%u";
+    table[static_cast<int>(LK::UI_s_FPS_6_1f_Avg_6_1f_s_s_s_u_u_u)] = "%s | FPS: %6.1f, Avg: %6.1f %s | %s -> %s %u.%u.%u";
+    table[static_cast<int>(LK::UI_s_FPS_6_1f_5_1f_Avg_6_1f_s)] = "%s | FPS: %6.1f/%5.1f, Avg: %6.1f %s";
+    table[static_cast<int>(LK::UI_s_FPS_6_1f_Avg_6_1f_s)] = "%s | FPS: %6.1f, Avg: %6.1f %s";
+    table[static_cast<int>(LK::UI_D3D11_s_s_d_d_d)] = "D3D11 %s| %s %d.%d.%d";
+    table[static_cast<int>(LK::UI_Vulkan_s_s_d_d_d)] = "Vulkan %s| %s %d.%d.%d";
+    table[static_cast<int>(LK::UI_Apply_2)] = "Apply##2";
 }
