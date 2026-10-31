@@ -246,7 +246,9 @@ jobs:
         if: steps.target.outputs.should_release == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          BAIDU_APP_ID: ${{ secrets.BAIDU_APP_ID }}
+          BAIDU_API_KEY: ${{ secrets.BAIDU_API_KEY }}
+          BAIDU_SECRET_KEY: ${{ secrets.BAIDU_SECRET_KEY }}
           UPSTREAM_TAG: ${{ steps.target.outputs.upstream_tag }}
           UPSTREAM_CHANNEL: ${{ steps.target.outputs.upstream_channel }}
           SOURCE_SHA: ${{ steps.target.outputs.source_sha }}
@@ -292,9 +294,9 @@ jobs:
 
           translation_status="none"
           if [ "${pending_count:-0}" -gt 0 ]; then
-            if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
-              translation_status="pending-no-api-key:$pending_count"
-              echo "::warning::有 $pending_count 条新增字符串，但未配置 DEEPSEEK_API_KEY，发布包将回退英文。"
+            if [ -z "${BAIDU_APP_ID:-}" ] || { [ -z "${BAIDU_API_KEY:-}" ] && [ -z "${BAIDU_SECRET_KEY:-}" ]; }; then
+              translation_status="pending-no-baidu-credentials:$pending_count"
+              echo "::warning::有 $pending_count 条新增字符串，但未配置百度翻译凭据，发布包将回退英文。"
             else
               set +e
               python scripts/translate.py --input pending.json
@@ -313,7 +315,6 @@ jobs:
           set +e
           python scripts/sync_docs.py \
             --repo "$GITHUB_WORKSPACE" \
-            --api-key "${DEEPSEEK_API_KEY:-}" \
             --upstream-ref "$SOURCE_SHA"
           docs_code=$?
           set -e

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-自动翻译新字符串（DeepSeek API）并更新汉化文件
-用法: python translate.py --input pending.json [--key <API_KEY>]
+自动翻译新字符串（百度大模型文本翻译）并更新汉化文件
+用法: python translate.py --input pending.json
 流程:
   1. 读待翻译列表
-  2. 调 DeepSeek 翻译（带术语表保证一致性；thinking 显式关闭，防思考链吃光输出预算）
+  2. 调用百度大模型文本翻译 API
   3. 生成新 LK key → 更新 localization.h / lang_en.h / lang_zh_cn.h / strings_map.json
 失败语义: 翻译失败直接 exit 1、不写任何文件（防英文兜底污染 strings_map 后永久跳过）
 """
@@ -14,12 +14,8 @@ import json
 import os
 import re
 import sys
-import urllib.request
-import io
-import json
-import os
-import re
-import sys
+
+from baidu_translate import BaiduTranslateError, translate_texts
 
 # Windows 控制台默认 cp1252，强制 UTF-8 输出避免 UnicodeEncodeError
 if hasattr(sys.stdout, 'reconfigure'):
@@ -35,88 +31,6 @@ EN_H = os.path.normpath(os.path.join(HERE, '..', 'overlay', 'OptiScaler', 'local
 ZH_H = os.path.normpath(os.path.join(HERE, '..', 'overlay', 'OptiScaler', 'localization', 'lang_zh_cn.h'))
 MAP = os.path.join(HERE, 'strings_map.json')
 
-# 术语表：保证翻译一致性
-GLOSSARY = """游戏/计算机术语对照表（必须严格遵守）：
-- Upscaler = 超分辨率
-- Upscaling = 超分
-- Frame Generation / FG = 帧生成
-- Motion Vectors / MV = 运动矢量
-- HUDLess = HUDLess（保留）
-- Reactive Mask = Reactive Mask（保留）
-- Ghosting = 拖影
-- Artifacts = 伪影
-- Overlay = 覆盖层
-- V-Sync = 垂直同步
-- Shader = 着色器
-- Preset = 预设
-- Sharpness = 锐化
-- Depth = 深度
-- Latency = 延迟
-- Toggle = 切换
-- Hook = 挂钩
-- Tooltip = 提示
-- DLSS/FSR/XeSS/RCAS/DA/MAS/MFG/DLSSG/XeFG/OptiFG = 保留英文
-- PRESSET A~O / DEFAULT / Latest = 保留英文
-- Don't / Can't = 不要 / 不能
-"""
-
-def call_deepseek(api_key, texts):
-    """批量翻译"""
-    prompt = GLOSSARY + '\n请把以下 JSON 数组中的英文 UI 字符串翻译成简体中文（游戏软件风格，保留 %s/%d/%llu 等格式符和 \\n 换行，保留 HTML/技术术语），输出 JSON 数组，一一对应：\n' + json.dumps(texts, ensure_ascii=False)
-    body = json.dumps({
-        # 2026-09-10 起 deepseek-v4-flash 已下线、旧名仅暂时路由到 V4.1-Flash；
-        # V4.1-Flash 的 thinking 默认 enabled 且思考 tokens 计入输出预算，
-        # 不显式关闭会在 max_tokens 内吃光预算、content 返回空（2026-10-03 事故）
-        "model": "deepseek-flash",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3,
-        "thinking": {"type": "disabled"},
-        "max_tokens": 8192,
-    }).encode('utf-8')
-    req = urllib.request.Request(
-        'https://api.deepseek.com/chat/completions',
-        data=body,
-        headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {api_key}'},
-    )
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        data = json.loads(resp.read().decode('utf-8'))
-    choice = data['choices'][0]
-    content = choice['message'].get('content') or ''
-    if not content.strip():
-        # 空 content 携带 finish_reason/usage 上抛，典型形态：finish_reason=length
-        # 且 usage.completion_tokens_details.reasoning_tokens == max_tokens（思考链撞顶）
-        raise RuntimeError(
-            f'空响应: finish_reason={choice.get("finish_reason")}, usage={data.get("usage")}')
-    # 提取 JSON 数组
-    m = re.search(r'\[.*\]', content, re.S)
-    if not m:
-        raise RuntimeError(f'无法解析翻译结果: {content[:300]}')
-    return json.loads(m.group(0))
-
-
-def call_deepseek_retry(api_key, texts, max_retries=3):
-    """调用 DeepSeek 翻译，返回与 texts 等长的列表。
-    重试只兜网络抖动/采样随机性；耗尽即 exit 1——原文兜底会把英文写进 zh 表
-    并登记 strings_map.json，登记过的串永远不再进入 pending，一次失败变永久英文
-    （2026-10-03 事故：87 条全灭入库）。exit 1 让 workflow 步骤失败、阻断 commit，
-    字串保持 pending 等下一轮重试。"""
-    res = None
-    last_err = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            res = call_deepseek(api_key, texts)
-            if not isinstance(res, list):
-                raise RuntimeError(f'返回不是数组: {type(res)}')
-            if len(res) == len(texts):
-                return res
-            last_err = f'数量不匹配: {len(res)} != {len(texts)}'
-            print(f'    重试 {attempt}: {last_err}')
-        except Exception as e:
-            last_err = str(e)
-            print(f'    重试 {attempt}: {e}')
-    print(f'    ⚠️ 重试耗尽（{last_err}），{len(texts)} 条保持 pending，本轮不写任何文件')
-    sys.exit(1)
-
 def key_from_en(en):
     """英文串 → 合法 key 名"""
     words = re.findall(r'[A-Za-z0-9]+', en)
@@ -127,7 +41,7 @@ def key_from_en(en):
 
 def c_lit(s):
     """译文 → C 字符串字面量内容。
-    DeepSeek 的 JSON 响应经 json.loads 后 \\n 会变成真实换行，直接写进
+    翻译 API 的 JSON 响应经 json.loads 后 \\n 会变成真实换行，直接写进
     头文件会让字符串常量跨行断掉（C2001，2026-09-10 nightly 编译事故）。
     模型也可能输出字面 \\n，先归一成真实换行再统一转义。
     仅用于 zh 侧：en 侧字符串本身就是上游 C 源码的字面量片段，透传即可。"""
@@ -141,13 +55,10 @@ def c_lit(s):
 def main():
     args = sys.argv[1:]
     inp = None
-    api_key = os.environ.get('DEEPSEEK_API_KEY', '')
     if '--input' in args:
         inp = args[args.index('--input') + 1]
-    if '--key' in args:
-        api_key = args[args.index('--key') + 1]
-    if not inp or not api_key:
-        print('用法: translate.py --input pending.json --key <API_KEY>')
+    if not inp:
+        print('用法: translate.py --input pending.json')
         sys.exit(1)
 
     with io.open(inp, encoding='utf-8') as f:
@@ -156,13 +67,11 @@ def main():
         print('没有待翻译字符串')
         return
 
-    # 分批（每批 50 条），带重试；失败退出不写文件
-    zh_all = []
-    BATCH = 50
-    for i in range(0, len(pending), BATCH):
-        batch = pending[i:i + BATCH]
-        print(f'翻译批次 {i // BATCH + 1}/{(len(pending) + BATCH - 1) // BATCH} ({len(batch)} 条)...')
-        zh_all.extend(call_deepseek_retry(api_key, batch))
+    try:
+        zh_all = translate_texts(pending)
+    except BaiduTranslateError as exc:
+        print(f'!! 百度翻译失败: {exc}')
+        sys.exit(1)
 
     if len(zh_all) != len(pending):
         print(f'!! 翻译数量不匹配: {len(zh_all)} != {len(pending)}')

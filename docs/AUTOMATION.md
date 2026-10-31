@@ -32,14 +32,26 @@
 
 ## 可选翻译密钥
 
-新增界面字符串和文档自动翻译使用 DeepSeek。仓库没有 `DEEPSEEK_API_KEY` 时仍会完成构建和发布，
+新增界面字符串和文档自动翻译使用[百度大模型文本翻译 API](https://fanyi-api.baidu.com/doc/21)。
+仓库没有百度翻译凭据时仍会完成构建和发布，
 已有翻译继续生效，新字符串回退英文，Release 说明会标记翻译状态。
 
-如需完整自动翻译，在仓库的 `Settings -> Secrets and variables -> Actions` 中添加：
+在百度翻译开放平台创建 APP ID 和 API Key 后，在仓库的
+`Settings -> Secrets and variables -> Actions` 中添加：
 
 ```text
-DEEPSEEK_API_KEY
+BAIDU_APP_ID
+BAIDU_API_KEY
 ```
+
+如果账号只提供 APP ID + 密钥、不提供 API Key，也可以改用 MD5 签名鉴权：
+
+```text
+BAIDU_APP_ID
+BAIDU_SECRET_KEY
+```
+
+同时配置 API Key 和 Secret Key 时，工作流优先使用官方的 Bearer API Key 鉴权。
 
 ## 首次启用
 

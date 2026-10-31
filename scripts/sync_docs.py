@@ -8,7 +8,7 @@ CONTRIBUTING/OptiScaler.ini），防止上游覆盖中文版。本脚本负责"�
 
 1. OptiScaler.ini（结构化，全自动合并）：
    - 对比上游英文版与本地中文版的 section/key 结构
-   - 上游新增 key -> 用 strings_map.json 已有翻译，没有的调 DeepSeek 翻译注释，插入中文版
+   - 上游新增 key -> 用 strings_map.json 已有翻译，没有的调百度大模型文本翻译注释，插入中文版
    - 上游删除 key -> 从中文版删除
    - key 顺序变化 -> 按上游顺序重排（本地已翻译的注释保留不动）
 
@@ -17,12 +17,12 @@ CONTRIBUTING/OptiScaler.ini），防止上游覆盖中文版。本脚本负责"�
    - 上游英文版与快照对比 -> 有变化才处理：
      * README.md：定制内容多，仅生成变更报告（docs/UPSTREAM_CHANGES.md）
      * 其他文档：自动整篇翻译并覆盖中文版（内容基本来自上游，可接受）
-     * DeepSeek 不可用：全部走报告
+     * 百度翻译不可用：全部走报告
 
 退出码：0 = 无变更；2 = 有变更（需提交）
 
 用法：
-  python scripts/sync_docs.py --repo <仓库根> [--api-key <DeepSeek key>] [--dry-run]
+  python scripts/sync_docs.py --repo <仓库根> [--dry-run]
 
 依赖：Python 3.8+，标准库（urllib/json/re），无第三方依赖。
 """
@@ -34,7 +34,13 @@ import os
 import re
 import subprocess
 import sys
-import urllib.request
+
+from baidu_translate import (
+    BaiduTranslateError,
+    credentials_available,
+    translate_text,
+    translate_texts,
+)
 
 try:
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -57,19 +63,6 @@ UPSTREAM_REMOTE = 'upstream'
 UPSTREAM_BRANCH = 'master'
 _UPSTREAM_REF = [f'{UPSTREAM_REMOTE}/{UPSTREAM_BRANCH}']
 REF_DIR = 'docs/upstream_ref'
-
-GLOSSARY = """
-术语表（必须遵守）：
-- DLSS/FSR/XeSS/RCAS/MAS/MFG/DLSSG/XeFG/OptiFG/FG/HUD/VRAM/D3D/DXGI/Dx11/Dx12/Vulkan = 保留英文
-- Upscaler = 超分辨率技术（超分）
-- Frame Generation = 帧生成
-- Default (auto) = 默认 (auto)
-- true or false = true 或 false
-- DLL 文件名/路径/URL/十六进制值 = 保留原样
-- 游戏名（如 Cyberpunk 2077、Witcher 3）= 保留英文
-- Markdown 语法、代码块、图片链接 = 保留原样
-"""
-
 
 def run_git(repo, args, check=True):
     """在 repo 中执行 git 命令，返回 stdout 文本"""
@@ -98,55 +91,6 @@ def get_upstream_file(repo, path):
         return run_git(repo, ['show', f'{_UPSTREAM_REF[0]}:{path}'])
     except RuntimeError:
         return None
-
-
-def call_deepseek(api_key, texts):
-    """批量翻译文本（DeepSeek），返回与 texts 等长的列表"""
-    if not api_key:
-        raise RuntimeError('无 API key')
-    prompt = GLOSSARY + '\n请把以下 JSON 数组中的英文内容翻译成简体中文（保留 Markdown/ini 格式、代码块、数值、DLL 文件名、URL、选项值不翻译），输出 JSON 数组，一一对应：\n' + json.dumps(texts, ensure_ascii=False)
-    body = json.dumps({
-        "model": "deepseek-flash",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3,
-        "thinking": {"type": "disabled"},
-        "max_tokens": 8192,
-    }).encode('utf-8')
-    req = urllib.request.Request(
-        'https://api.deepseek.com/chat/completions',
-        data=body,
-        headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {api_key}'},
-    )
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        data = json.loads(resp.read().decode('utf-8'))
-    content = data['choices'][0]['message']['content']
-    m = re.search(r'\[.*\]', content, re.S)
-    if not m:
-        raise RuntimeError(f'无法解析翻译结果: {content[:300]}')
-    return json.loads(m.group(0))
-
-
-def call_deepseek_retry(api_key, texts, max_retries=3):
-    """重试版翻译，失败用原文兜底"""
-    res = None
-    last_err = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            res = call_deepseek(api_key, texts)
-            if isinstance(res, list) and len(res) == len(texts):
-                return res
-            last_err = f'数量不匹配: {len(res) if isinstance(res, list) else type(res)} != {len(texts)}'
-            print(f'  重试 {attempt}: {last_err}')
-        except Exception as e:
-            last_err = str(e)
-            print(f'  重试 {attempt}: {e}')
-    out = []
-    for i, t in enumerate(texts):
-        if res is not None and i < len(res) and isinstance(res[i], str) and res[i].strip():
-            out.append(res[i])
-        else:
-            out.append(t)
-    return out
 
 
 def load_strings_map(repo):
@@ -186,7 +130,7 @@ def parse_ini(text):
     return entries
 
 
-def merge_ini(upstream_text, local_text, api_key):
+def merge_ini(upstream_text, local_text):
     """增量合并：以本地中文版为基准，跟随上游结构。
     返回 (新内容, 变更统计 dict)
     """
@@ -208,7 +152,11 @@ def merge_ini(upstream_text, local_text, api_key):
 
     if to_translate:
         texts = ['\n'.join(e['comments']) if e['comments'] else '' for e in to_translate]
-        translated = call_deepseek_retry(api_key, texts)
+        try:
+            translated = translate_texts(texts)
+        except BaiduTranslateError as exc:
+            print(f'[ini] 百度翻译失败，保留英文注释: {exc}')
+            translated = texts
         for e, t in zip(to_translate, translated):
             e['_translated_comments'] = t.splitlines() if t else []
 
@@ -254,7 +202,7 @@ def merge_ini(upstream_text, local_text, api_key):
     return new_content, stats
 
 
-def sync_md_docs(repo, api_key):
+def sync_md_docs(repo):
     """md 文档跟随：上游英文快照对比 + 分级处理。
     返回 (changed_files, report_lines)
     """
@@ -293,18 +241,18 @@ def sync_md_docs(repo, api_key):
             continue
 
         # auto 模式：自动翻译覆盖
-        if api_key:
+        if credentials_available():
             try:
-                translated = call_deepseek_retry(api_key, [up_text])
-                if translated and translated[0] != up_text and translated[0].strip():
+                translated_text = translate_text(up_text)
+                if translated_text and translated_text != up_text and translated_text.strip():
                     if not args_dry_run_global():
-                        write_file(os.path.join(repo, doc), translated[0])
+                        write_file(os.path.join(repo, doc), translated_text)
                     report.append(f'- {doc}: 已自动翻译上游更新')
                     print(f'[md] {doc}: 已自动翻译覆盖')
                     continue
-            except Exception as e:
+            except BaiduTranslateError as e:
                 report.append(f'- {doc}: 自动翻译失败 ({e})')
-        report.append(f'- {doc}: 上游有更新，DeepSeek 不可用，需要人工处理')
+        report.append(f'- {doc}: 上游有更新，百度翻译不可用，需要人工处理')
         print(f'[md] {doc}: 上游有更新，自动翻译不可用')
 
     return changed, report
@@ -321,13 +269,18 @@ def main():
     global _DRY_RUN
     parser = argparse.ArgumentParser(description='汉化文档增量同步')
     parser.add_argument('--repo', required=True, help='仓库根目录')
-    parser.add_argument('--api-key', default=os.environ.get('DEEPSEEK_API_KEY', ''), help='DeepSeek API key')
+    parser.add_argument('--app-id', default=os.environ.get('BAIDU_APP_ID', ''), help='百度翻译 APP ID')
+    parser.add_argument('--api-key', default=os.environ.get('BAIDU_API_KEY', ''), help='百度 API Key（Bearer）')
+    parser.add_argument('--secret-key', default=os.environ.get('BAIDU_SECRET_KEY', ''), help='百度密钥（MD5 sign 回退）')
     parser.add_argument('--upstream-ref', default=f'{UPSTREAM_REMOTE}/{UPSTREAM_BRANCH}',
                         help='要读取的上游 git ref，默认 upstream/master')
     parser.add_argument('--dry-run', action='store_true', help='只检测不写文件')
     args = parser.parse_args()
     _DRY_RUN[0] = args.dry_run
     _UPSTREAM_REF[0] = args.upstream_ref
+    os.environ['BAIDU_APP_ID'] = args.app_id
+    os.environ['BAIDU_API_KEY'] = args.api_key
+    os.environ['BAIDU_SECRET_KEY'] = args.secret_key
 
     repo = os.path.abspath(args.repo)
     load_strings_map(repo)  # 兼容旧参数（保留）
@@ -356,7 +309,7 @@ def main():
         if up_text == local_text:
             print(f'[ini] {doc}: 上游无变化')
             continue
-        new_content, stats = merge_ini(up_text, local_text, args.api_key)
+        new_content, stats = merge_ini(up_text, local_text)
         print(f'[ini] {doc}: added={stats["added"]} removed={stats["removed"]} kept={stats["kept"]}')
         if stats['added'] or stats['removed']:
             all_changed.append(doc)
@@ -365,7 +318,7 @@ def main():
                 write_file(os.path.join(repo, doc), new_content)
 
     # 2. md 变更检测
-    md_changed, md_report = sync_md_docs(repo, args.api_key)
+    md_changed, md_report = sync_md_docs(repo)
     all_changed.extend(md_changed)
     report_lines.extend(md_report)
 
