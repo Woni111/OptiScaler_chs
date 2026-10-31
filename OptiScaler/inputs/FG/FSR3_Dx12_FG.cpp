@@ -1,11 +1,8 @@
 #include "pch.h"
 #include "FSR3_Dx12_FG.h"
-#include "Upscaler_Inputs.h"
 
 #include "Config.h"
 #include "Util.h"
-#include "MathUtils.h"
-#include <misc/DeferredRelease.h>
 
 #include "resource.h"
 #include "NVNGX_Parameter.h"
@@ -26,7 +23,6 @@
 #include "fsr3/ffx_frameinterpolation.h"
 
 const UINT fgContext = 0x1337;
-using namespace OptiMath;
 
 // Swapchain create
 typedef FFX_API
@@ -316,8 +312,8 @@ static bool CreateBufferResource(ID3D12Device* InDevice, ID3D12Resource* InResou
 
         if (bufDesc.Width != inDesc.Width || bufDesc.Height != inDesc.Height || bufDesc.Format != inDesc.Format)
         {
-            // FG can still be using it
-            DeferredRelease::Release(*OutResource);
+            (*OutResource)->Release();
+            (*OutResource) = nullptr;
             LOG_WARN("Release {}x{}, new one: {}x{}", bufDesc.Width, bufDesc.Height, inDesc.Width, inDesc.Height);
         }
         else
@@ -341,16 +337,6 @@ static bool CreateBufferResource(ID3D12Device* InDevice, ID3D12Resource* InResou
 
     LOG_DEBUG("Created new one: {}x{}", inDesc.Width, inDesc.Height);
     return true;
-}
-
-// Game's FG context is gone, nothing uses these until it's recreated
-static void ReleaseBuffers()
-{
-    for (size_t i = 0; i < BUFFER_COUNT; i++)
-    {
-        DeferredRelease::Release(_hudless[i]);
-        DeferredRelease::Release(_interpolation[i]);
-    }
 }
 
 static void ResourceBarrier(ID3D12GraphicsCommandList* InCommandList, ID3D12Resource* InResource,
@@ -622,7 +608,8 @@ static Fsr3::FfxErrorCode hkffxFrameInterpolationDispatch(FfxFrameInterpolationC
     fg->SetFrameTimeDelta(params->frameTimeDelta);
     fg->SetReset(params->reset ? 1 : 0);
 
-    if (params->currentBackBuffer_HUDLess.resource != nullptr && !fg->GetResource(FG_ResourceType::HudlessColor))
+    if (params->currentBackBuffer_HUDLess.resource != nullptr &&
+        fg->GetResource(FG_ResourceType::HudlessColor) == nullptr)
     {
         UINT width = params->interpolationRect.width;
         UINT height = params->interpolationRect.height;
@@ -651,7 +638,7 @@ static Fsr3::FfxErrorCode hkffxFrameInterpolationDispatch(FfxFrameInterpolationC
     }
 
     if (_presentCallback != nullptr && params->currentBackBuffer.resource != nullptr &&
-        !fg->GetResource(FG_ResourceType::HudlessColor))
+        fg->GetResource(FG_ResourceType::HudlessColor) == nullptr)
     {
         UINT width = params->interpolationRect.width;
         UINT height = params->interpolationRect.height;
@@ -693,7 +680,6 @@ static Fsr3::FfxErrorCode hkffxFrameInterpolationContextDestroy(FfxFrameInterpol
     {
         LOG_INFO("Destroying FG Context: {:X}", (size_t) State::Instance().currentFG);
         State::Instance().currentFG->DestroyFGContext();
-        ReleaseBuffers();
     }
 
     return Fsr3::FFX_OK;
@@ -717,9 +703,9 @@ static Fsr3::FfxErrorCode hkffxFsr3ConfigureFrameGeneration(void* context, Fsr3:
     {
         LOG_DEBUG("frameGenerationEnabled: {} ", config->frameGenerationEnabled);
 
-        s.fsrfgInputActive = config->frameGenerationEnabled;
+        s.FSRFGInputActive = config->frameGenerationEnabled;
 
-        if (config->frameGenerationEnabled && !fg->IsActive() && Config::Instance()->IsFGEnabled())
+        if (config->frameGenerationEnabled && !fg->IsActive() && Config::Instance()->FGEnabled.value_or_default())
         {
             if (!fg->IsPaused())
             {
@@ -801,9 +787,9 @@ static Fsr3::FfxErrorCode hkffxSetFrameGenerationConfigToSwapchainDX12(Fsr3::Ffx
     {
         LOG_DEBUG("frameGenerationEnabled: {} ", config->frameGenerationEnabled);
 
-        s.fsrfgInputActive = config->frameGenerationEnabled;
+        s.FSRFGInputActive = config->frameGenerationEnabled;
 
-        if (config->frameGenerationEnabled && !fg->IsActive() && Config::Instance()->IsFGEnabled())
+        if (config->frameGenerationEnabled && !fg->IsActive() && Config::Instance()->FGEnabled.value_or_default())
         {
             if (!fg->IsPaused())
             {
@@ -833,7 +819,7 @@ static Fsr3::FfxErrorCode hkffxSetFrameGenerationConfigToSwapchainDX12(Fsr3::Ffx
             left = 0;
         }
 
-        if (config->HUDLessColor.resource != nullptr && !fg->GetResource(FG_ResourceType::HudlessColor))
+        if (config->HUDLessColor.resource != nullptr && fg->GetResource(FG_ResourceType::HudlessColor) == nullptr)
         {
             Dx12Resource ui {};
             ui.cmdList = nullptr; // Not sure about this
@@ -1189,7 +1175,7 @@ void FSR3FG::ffxPresentCallback()
 
         if (result == FFX_API_RETURN_OK)
         {
-            if (!fg->GetResource(FG_ResourceType::HudlessColor, fIndex))
+            if (fg->GetResource(FG_ResourceType::HudlessColor, fIndex) == nullptr)
             {
                 auto hDesc = _hudless[fIndex]->GetDesc();
                 Dx12Resource hudless {};
@@ -1283,7 +1269,7 @@ void FSR3FG::ffxPresentCallback()
 
         if (result == FFX_API_RETURN_OK)
         {
-            if (!fg->GetResource(FG_ResourceType::HudlessColor, fIndex))
+            if (fg->GetResource(FG_ResourceType::HudlessColor, fIndex) == nullptr)
             {
                 auto hDesc = _hudless[fIndex]->GetDesc();
                 Dx12Resource hudless {};
@@ -1325,21 +1311,58 @@ void FSR3FG::SetUpscalerInputs(ID3D12GraphicsCommandList* InCmdList, NVSDK_NGX_P
 
     fg->EvaluateState(_device, _fgConst);
 
-    // Not needed while FG or the option is off, its destructor defers the buffer release
-    if (DepthScale != nullptr &&
-        (!Config::Instance()->IsFGEnabled() || !Config::Instance()->FGEnableDepthScale.value_or_default()))
-    {
-        delete DepthScale;
-        DepthScale = nullptr;
-    }
-
+    // FSR Camera values
+    float cameraNear = 0.0f;
+    float cameraFar = 0.0f;
+    float cameraVFov = 0.0f;
+    float meterFactor = 0.0f;
     float mvScaleX = 0.0f;
     float mvScaleY = 0.0f;
     float jitterX = 0.0f;
     float jitterY = 0.0f;
 
-    // FSR Camera values
-    auto camera = UpscalerInputs::GetCameraValues(*InParameters, feature);
+    float tempCameraNear = 0.0f;
+    float tempCameraFar = 0.0f;
+    InParameters->Get("FSR.cameraNear", &tempCameraNear);
+    InParameters->Get("FSR.cameraFar", &tempCameraFar);
+
+    if (!Config::Instance()->FsrUseFsrInputValues.value_or_default() ||
+        (tempCameraNear == 0.0f && tempCameraFar == 0.0f))
+    {
+        if (feature->DepthInverted())
+        {
+            cameraFar = Config::Instance()->FsrCameraNear.value_or_default();
+            cameraNear = Config::Instance()->FsrCameraFar.value_or_default();
+        }
+        else
+        {
+            cameraFar = Config::Instance()->FsrCameraFar.value_or_default();
+            cameraNear = Config::Instance()->FsrCameraNear.value_or_default();
+        }
+    }
+    else
+    {
+        cameraNear = tempCameraNear;
+        cameraFar = tempCameraFar;
+    }
+
+    if (!Config::Instance()->FsrUseFsrInputValues.value_or_default() ||
+        InParameters->Get("FSR.cameraFovAngleVertical", &cameraVFov) != NVSDK_NGX_Result_Success)
+    {
+        if (Config::Instance()->FsrVerticalFov.has_value())
+            cameraVFov = Config::Instance()->FsrVerticalFov.value() * 0.0174532925199433f;
+        else if (Config::Instance()->FsrHorizontalFov.value_or_default() > 0.0f)
+            cameraVFov = 2.0f * atan((tan(Config::Instance()->FsrHorizontalFov.value() * 0.0174532925199433f) * 0.5f) /
+                                     (float) feature->TargetHeight() * (float) feature->TargetWidth());
+        else
+            cameraVFov = 1.0471975511966f;
+    }
+
+    if (!Config::Instance()->FsrUseFsrInputValues.value_or_default())
+        InParameters->Get("FSR.viewSpaceToMetersFactor", &meterFactor);
+
+    State::Instance().lastFsrCameraFar = cameraFar;
+    State::Instance().lastFsrCameraNear = cameraNear;
 
     int reset = 0;
     InParameters->Get(NVSDK_NGX_Parameter_Reset, &reset);
@@ -1350,7 +1373,7 @@ void FSR3FG::SetUpscalerInputs(ID3D12GraphicsCommandList* InCmdList, NVSDK_NGX_P
     InParameters->Get(NVSDK_NGX_Parameter_Jitter_Offset_Y, &jitterY);
 
     auto aspectRatio = (float) feature->DisplayWidth() / (float) feature->DisplayHeight();
-    fg->SetCameraValues(camera.cameraNear, camera.cameraFar, camera.cameraVFov, aspectRatio, camera.meterFactor);
+    fg->SetCameraValues(cameraNear, cameraFar, cameraVFov, aspectRatio, meterFactor);
     fg->SetFrameTimeDelta(State::Instance().lastFGFrameTime);
     fg->SetMVScale(mvScaleX, mvScaleY);
     fg->SetJitter(jitterX, jitterY);
@@ -1359,8 +1382,8 @@ void FSR3FG::SetUpscalerInputs(ID3D12GraphicsCommandList* InCmdList, NVSDK_NGX_P
 
     // FG Prepare
     UINT frameIndex;
-    if (!State::Instance().isShuttingDown && fg->IsActive() && Config::Instance()->IsFGEnabled() && !fg->IsPaused() &&
-        State::Instance().currentSwapchain != nullptr)
+    if (!State::Instance().isShuttingDown && fg->IsActive() && Config::Instance()->FGEnabled.value_or_default() &&
+        !fg->IsPaused() && State::Instance().currentSwapchain != nullptr)
     {
         //// Wait for present
         // if (fg->Mutex.getOwner() == 2)
@@ -1419,13 +1442,13 @@ void FSR3FG::SetUpscalerInputs(ID3D12GraphicsCommandList* InCmdList, NVSDK_NGX_P
                 if (DepthScale == nullptr)
                     DepthScale = new DS_Dx12("Depth Scale", _device);
 
-                if (DepthScale->CreateBufferResource(_device, paramDepth, 0, 0,
-                                                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS) &&
+                if (DepthScale->CreateBufferResource(_device, paramDepth, feature->DisplayWidth(),
+                                                     feature->DisplayHeight(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS) &&
                     DepthScale->Buffer() != nullptr)
                 {
                     DepthScale->SetBufferState(InCmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-                    if (DepthScale->Dispatch(InCmdList, paramDepth, DepthScale->Buffer()))
+                    if (DepthScale->Dispatch(_device, InCmdList, paramDepth, DepthScale->Buffer()))
                     {
                         Dx12Resource setResource {};
                         setResource.type = FG_ResourceType::Depth;
@@ -1434,7 +1457,7 @@ void FSR3FG::SetUpscalerInputs(ID3D12GraphicsCommandList* InCmdList, NVSDK_NGX_P
                         setResource.width = feature->RenderWidth();
                         setResource.height = feature->RenderHeight();
                         setResource.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-                        setResource.validity = FG_ResourceValidity::UntilPresent;
+                        setResource.validity = FG_ResourceValidity::JustTrackCmdlist;
 
                         fg->SetResource(&setResource);
 

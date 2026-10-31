@@ -210,8 +210,8 @@ class IGDExtProxy
 
         INTCExtensionAppInfo1 appInfo {};
 
-        appInfo.pApplicationName = string_to_wstring(State::Instance().gameName.empty() ? State::Instance().gameExe
-                                                                                        : State::Instance().gameName)
+        appInfo.pApplicationName = string_to_wstring(State::Instance().GameName.empty() ? State::Instance().GameExe
+                                                                                        : State::Instance().GameName)
                                        .c_str();
 
         appInfo.pApplicationName = L"Unreal Engine";
@@ -231,7 +231,8 @@ class IGDExtProxy
                 DestroyContext();
         }
 
-        delete[] extensionsVersions;
+        if (extensionsVersions != nullptr)
+            delete[] extensionsVersions;
 
         return true;
     }
@@ -294,33 +295,29 @@ class IGDExtProxy
 
         _module = module;
 
-        _INTC_D3D12_GetSupportedVersions = (PFN_INTC_D3D12_GetSupportedVersions) KernelBaseProxy::GetProcAddress_()(
-            module, "_INTC_D3D12_GetSupportedVersions");
+        _INTC_D3D12_GetSupportedVersions =
+            (PFN_INTC_D3D12_GetSupportedVersions) GetProcAddress(module, "_INTC_D3D12_GetSupportedVersions");
 
-        _INTC_D3D12_CreateDeviceExtensionContext1 =
-            (PFN_INTC_D3D12_CreateDeviceExtensionContext1) KernelBaseProxy::GetProcAddress_()(
-                module, "_INTC_D3D12_CreateDeviceExtensionContext1");
+        _INTC_D3D12_CreateDeviceExtensionContext1 = (PFN_INTC_D3D12_CreateDeviceExtensionContext1) GetProcAddress(
+            module, "_INTC_D3D12_CreateDeviceExtensionContext1");
 
         _INTC_DestroyDeviceExtensionContext =
-            (PFN_INTC_DestroyDeviceExtensionContext) KernelBaseProxy::GetProcAddress_()(
-                module, "_INTC_DestroyDeviceExtensionContext");
+            (PFN_INTC_DestroyDeviceExtensionContext) GetProcAddress(module, "_INTC_DestroyDeviceExtensionContext");
 
-        _INTC_D3D12_CheckFeatureSupport = (PFN_INTC_D3D12_CheckFeatureSupport) KernelBaseProxy::GetProcAddress_()(
-            module, "_INTC_D3D12_CheckFeatureSupport");
+        _INTC_D3D12_CheckFeatureSupport =
+            (PFN_INTC_D3D12_CheckFeatureSupport) GetProcAddress(module, "_INTC_D3D12_CheckFeatureSupport");
 
-        _INTC_D3D12_SetFeatureSupport = (PFN_INTC_D3D12_SetFeatureSupport) KernelBaseProxy::GetProcAddress_()(
-            module, "_INTC_D3D12_SetFeatureSupport");
+        _INTC_D3D12_SetFeatureSupport =
+            (PFN_INTC_D3D12_SetFeatureSupport) GetProcAddress(module, "_INTC_D3D12_SetFeatureSupport");
 
         _INTC_D3D12_CreateCommittedResource =
-            (PFN_INTC_D3D12_CreateCommittedResource) KernelBaseProxy::GetProcAddress_()(
-                module, "_INTC_D3D12_CreateCommittedResource");
+            (PFN_INTC_D3D12_CreateCommittedResource) GetProcAddress(module, "_INTC_D3D12_CreateCommittedResource");
 
-        _INTC_D3D12_CreatePlacedResource = (PFN_INTC_D3D12_CreatePlacedResource) KernelBaseProxy::GetProcAddress_()(
-            module, "_INTC_D3D12_CreatePlacedResource");
+        _INTC_D3D12_CreatePlacedResource =
+            (PFN_INTC_D3D12_CreatePlacedResource) GetProcAddress(module, "_INTC_D3D12_CreatePlacedResource");
 
         _INTC_D3D12_GetResourceAllocationInfo =
-            (PFN_INTC_D3D12_GetResourceAllocationInfo) KernelBaseProxy::GetProcAddress_()(
-                module, "_INTC_D3D12_GetResourceAllocationInfo");
+            (PFN_INTC_D3D12_GetResourceAllocationInfo) GetProcAddress(module, "_INTC_D3D12_GetResourceAllocationInfo");
     }
 
     static void EnableAtomicSupport(ID3D12Device* device)
@@ -328,7 +325,7 @@ class IGDExtProxy
         if (_atomicSupportEnabled)
             return;
 
-        ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
+        ScopedSkipSpoofing skipSpoofing {};
 
         if (CreateContext(device))
         {

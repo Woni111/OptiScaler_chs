@@ -12,10 +12,6 @@ class FSR2FeatureVk212 : public FSR2Feature212, public IFeature_Vk
   protected:
     bool InitFSR2(const NVSDK_NGX_Parameter* InParameters);
 
-    // From IFeature_Vk
-    bool InitInternal(VkCommandBuffer InCmdList, NVSDK_NGX_Parameter* InParameters) override;
-    bool EvaluateInternal(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InParameters) override;
-
   public:
     FSR2FeatureVk212(unsigned int InHandleId, NVSDK_NGX_Parameter* InParameters)
         : FSR2Feature212(InHandleId, InParameters), IFeature_Vk(InHandleId, InParameters),
@@ -23,14 +19,13 @@ class FSR2FeatureVk212 : public FSR2Feature212, public IFeature_Vk
     {
     }
 
+    bool Init(VkInstance InInstance, VkPhysicalDevice InPD, VkDevice InDevice, VkCommandBuffer InCmdList,
+              PFN_vkGetInstanceProcAddr InGIPA, PFN_vkGetDeviceProcAddr InGDPA,
+              NVSDK_NGX_Parameter* InParameters) override;
+    bool Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InParameters) override;
+
     feature_version Version() override { return FSR2Feature212::Version(); }
-    Upscaler GetUpscalerType() const final { return Upscaler::FSR21; }
-    API Api() const override { return IFeature_Vk::Api(); }
-    std::optional<double> ReadUpscalerTime(void* unused) override { return IFeature_Vk::ReadUpscalerTime(unused); };
-    void ReadDetailedGpuTimes(void* unused, std::vector<DetailedGpuTime>& detailedGpuTimes) override
-    {
-        return IFeature_Vk::ReadDetailedGpuTimes(unused, detailedGpuTimes);
-    };
+    std::string Name() const override { return FSR2Feature212::Name(); }
 
     bool IsWithDx12() override { return false; }
 };

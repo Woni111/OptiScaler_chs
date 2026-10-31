@@ -12,19 +12,18 @@ class DLSSFeature : public virtual IFeature
   protected:
     NVSDK_NGX_Handle _dlssHandle = {};
     NVSDK_NGX_Handle* _p_dlssHandle = nullptr;
-    bool _dlssInited = false;
+    inline static bool _dlssInited = false;
 
     void ProcessEvaluateParams(NVSDK_NGX_Parameter* InParameters);
     void ProcessInitParams(NVSDK_NGX_Parameter* InParameters);
-    // A custom NGX runtime has no snippet to ask, its file version is used instead
-    void ReadVersion(const std::wstring& customDll = L"");
+    void ReadVersion();
 
-    void Shutdown();
+    static void Shutdown();
     float GetSharpness(const NVSDK_NGX_Parameter* InParameters);
 
   public:
     feature_version Version() override { return feature_version { _version.major, _version.minor, _version.patch }; }
-    Upscaler GetUpscalerType() const override { return Upscaler::DLSS; }
+    std::string Name() const override { return "DLSS"; }
 
     DLSSFeature(unsigned int handleId, NVSDK_NGX_Parameter* InParameters);
 

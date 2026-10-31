@@ -1,19 +1,12 @@
 #include "pch.h"
 
 #include "FSRFG_Dx12.h"
-
 #include <State.h>
-#include <Util.h>
 
-#include <hudfix/Hudfix_Dx11.h>
 #include <hudfix/Hudfix_Dx12.h>
 #include <menu/menu_overlay_dx.h>
-#include <misc/DeferredRelease.h>
 
 #include <magic_enum.hpp>
-#include <DirectXMath.h>
-
-using namespace DirectX;
 
 #define FFX_FRAMEGENERATION_SWAPCHAIN_DX12_VERSION_MAJOR 3
 #define FFX_FRAMEGENERATION_SWAPCHAIN_DX12_VERSION_MINOR 1
@@ -178,12 +171,6 @@ bool FSRFG_Dx12::HudlessFormatTransfer(int index, ID3D12Device* device, DXGI_FOR
     {
         auto cmdList = GetUICommandList(index);
 
-        if (cmdList == nullptr)
-        {
-            LOG_ERROR("GetUICommandList({}) failed", index);
-            return false;
-        }
-
         if (resource->cmdList != nullptr && _hudlessCopyResource[index] != nullptr)
         {
             ResourceBarrier(resource->cmdList, resource->GetResource(), resource->state,
@@ -197,7 +184,7 @@ bool FSRFG_Dx12::HudlessFormatTransfer(int index, ID3D12Device* device, DXGI_FOR
             ResourceBarrier(resource->cmdList, _hudlessCopyResource[index], D3D12_RESOURCE_STATE_COPY_DEST,
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-            _hudlessTransfer[index].get()->Dispatch(cmdList, _hudlessCopyResource[index],
+            _hudlessTransfer[index].get()->Dispatch(device, cmdList, _hudlessCopyResource[index],
                                                     _hudlessTransfer[index].get()->Buffer());
 
             ResourceBarrier(cmdList, _hudlessCopyResource[index], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -208,7 +195,7 @@ bool FSRFG_Dx12::HudlessFormatTransfer(int index, ID3D12Device* device, DXGI_FOR
             ResourceBarrier(cmdList, resource->GetResource(), resource->state,
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-            _hudlessTransfer[index].get()->Dispatch(cmdList, resource->GetResource(),
+            _hudlessTransfer[index].get()->Dispatch(device, cmdList, resource->GetResource(),
                                                     _hudlessTransfer[index].get()->Buffer());
 
             ResourceBarrier(cmdList, resource->GetResource(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -246,7 +233,8 @@ bool FSRFG_Dx12::UIFormatTransfer(int index, ID3D12Device* device, ID3D12Graphic
         ResourceBarrier(cmdList, resource->GetResource(), resource->state,
                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-        _uiTransfer[index].get()->Dispatch(cmdList, resource->GetResource(), _uiTransfer[index].get()->Buffer());
+        _uiTransfer[index].get()->Dispatch(device, cmdList, resource->GetResource(),
+                                           _uiTransfer[index].get()->Buffer());
 
         ResourceBarrier(cmdList, resource->GetResource(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                         resource->state);
@@ -271,7 +259,7 @@ typedef struct FfxSwapchainFramePacingTuning
 
 void FSRFG_Dx12::ConfigureFramePaceTuning()
 {
-    State::Instance().fsrfgFramePaceTuningChanged = false;
+    State::Instance().FSRFGFTPchanged = false;
 
     if (_swapChainContext == nullptr || Version() < feature_version { 3, 1, 3 })
         return;
@@ -346,10 +334,8 @@ bool FSRFG_Dx12::Dispatch()
     auto& state = State::Instance();
     auto config = Config::Instance();
 
-    if (state.fsrfgFramePaceTuningChanged)
+    if (state.FSRFGFTPchanged)
         ConfigureFramePaceTuning();
-
-    _reprojectionActive = config->FGReprojectionEnabled.value_or_default() && HasReprojection();
 
     LOG_DEBUG("_frameCount: {}, willDispatchFrame: {}, fIndex: {}", _frameCount, willDispatchFrame, fIndex);
 
@@ -368,45 +354,41 @@ bool FSRFG_Dx12::Dispatch()
     ffxConfigureDescFrameGenerationRegisterDistortionFieldResource distortionFieldDesc {};
     distortionFieldDesc.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION_REGISTERDISTORTIONRESOURCE;
 
+    auto distortion = GetResource(FG_ResourceType::Distortion, fIndex);
+    if (distortion != nullptr && IsResourceReady(FG_ResourceType::Distortion, fIndex))
     {
-        auto distortion = GetResource(FG_ResourceType::Distortion, fIndex);
-        if (distortion && IsResourceReady(FG_ResourceType::Distortion, fIndex))
-        {
-            LOG_TRACE("Using Distortion Field: {:X}", (size_t) distortion->GetResource());
+        LOG_TRACE("Using Distortion Field: {:X}", (size_t) distortion->GetResource());
 
-            distortionFieldDesc.distortionField =
-                ffxApiGetResourceDX12(distortion->GetResource(), GetFfxApiState(distortion->state));
+        distortionFieldDesc.distortionField =
+            ffxApiGetResourceDX12(distortion->GetResource(), GetFfxApiState(distortion->state));
 
-            distortionFieldDesc.header.pNext = fgConfig.header.pNext;
-            fgConfig.header.pNext = &distortionFieldDesc.header;
-        }
+        distortionFieldDesc.header.pNext = fgConfig.header.pNext;
+        fgConfig.header.pNext = &distortionFieldDesc.header;
     }
 
     ffxConfigureDescFrameGenerationSwapChainRegisterUiResourceDX12 uiDesc {};
     uiDesc.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_REGISTERUIRESOURCE_DX12;
     uiDesc.uiResource = FfxApiResource({});
 
+    auto hudless = GetResource(FG_ResourceType::HudlessColor, fIndex);
+
+    if (hudless != nullptr && IsResourceReady(FG_ResourceType::HudlessColor, fIndex))
     {
-        auto hudless = GetResource(FG_ResourceType::HudlessColor, fIndex);
+        LOG_TRACE("Using hudless: {:X}", (size_t) hudless->GetResource());
 
-        if (hudless && IsResourceReady(FG_ResourceType::HudlessColor, fIndex))
-        {
-            LOG_TRACE("Using hudless: {:X}", (size_t) hudless->GetResource());
+        fgConfig.HUDLessColor = ffxApiGetResourceDX12(hudless->GetResource(), GetFfxApiState(hudless->state));
 
-            fgConfig.HUDLessColor = ffxApiGetResourceDX12(hudless->GetResource(), GetFfxApiState(hudless->state));
+        // Because of HudlessTransfer hudless will be always in SC format
+        // Quick fix for typeless Hudless formats
+        fgConfig.HUDLessColor.description.format =
+            (FfxApiSurfaceFormat) ffxApiGetSurfaceFormatDX12(State::Instance().currentSwapchainDesc.BufferDesc.Format);
 
-            // Because of HudlessTransfer hudless will be always in SC format
-            // Quick fix for typeless Hudless formats
-            fgConfig.HUDLessColor.description.format = (FfxApiSurfaceFormat) ffxApiGetSurfaceFormatDX12(
-                State::Instance().currentSwapchainDesc.BufferDesc.Format);
-
-            // Reset of _paramHudless[fIndex] happens in DispatchCallback
-            // as we might use it in Preset to remove hud from swapchain
-        }
-        else
-        {
-            fgConfig.HUDLessColor = FfxApiResource({});
-        }
+        // Reset of _paramHudless[fIndex] happens in DispatchCallback
+        // as we might use it in Preset to remove hud from swapchain
+    }
+    else
+    {
+        fgConfig.HUDLessColor = FfxApiResource({});
     }
 
     FfxApiProxy::D3D12_Configure(&_swapChainContext, &uiDesc.header);
@@ -418,8 +400,8 @@ bool FSRFG_Dx12::Dispatch()
 
         if (localLastHudlessFormat != _lastHudlessFormat)
         {
-            state.fgChanged = true;
-            state.scChanged = true;
+            state.FGchanged = true;
+            state.SCchanged = true;
             LOG_DEBUG("HUDLESS format changed, triggering FG reinit");
         }
 
@@ -468,28 +450,6 @@ bool FSRFG_Dx12::Dispatch()
         fgConfig.generationRect.height = config->FGRectHeight.value_or(defaultHeight);
     }
 
-    if (_reprojectionActive)
-    {
-        fgConfig.presentCallbackUserContext = this;
-        fgConfig.presentCallback = [](ffxCallbackDescFrameGenerationPresent* params, void* pUserCtx) -> ffxReturnCode_t
-        {
-            FSRFG_Dx12* fsrFG = nullptr;
-
-            if (pUserCtx != nullptr)
-                fsrFG = reinterpret_cast<FSRFG_Dx12*>(pUserCtx);
-
-            if (fsrFG != nullptr)
-                return fsrFG->PresentCallback(params);
-
-            return FFX_API_RETURN_ERROR;
-        };
-    }
-    // else
-    //{
-    //     // Disables raw input hooks on destroy
-    //     Util::DelayedDestroy(std::move(_reproject));
-    // }
-
     fgConfig.frameGenerationCallbackUserContext = this;
     fgConfig.frameGenerationCallback = [](ffxDispatchDescFrameGeneration* params, void* pUserCtx) -> ffxReturnCode_t
     {
@@ -504,7 +464,7 @@ bool FSRFG_Dx12::Dispatch()
         return FFX_API_RETURN_ERROR;
     };
 
-    fgConfig.onlyPresentGenerated = state.fgOnlyGenerated;
+    fgConfig.onlyPresentGenerated = state.FGonlyGenerated;
     fgConfig.frameID = willDispatchFrame;
     fgConfig.swapChain = _swapChain;
 
@@ -567,44 +527,39 @@ bool FSRFG_Dx12::Dispatch()
         dfgPrepare.frameID = willDispatchFrame;
         dfgPrepare.flags = fgConfig.flags;
 
+        auto velocity = GetResource(FG_ResourceType::Velocity, fIndex);
+        auto depth = GetResource(FG_ResourceType::Depth, fIndex);
+
+        if (velocity != nullptr && IsResourceReady(FG_ResourceType::Velocity, fIndex))
         {
-            auto velocity = GetResource(FG_ResourceType::Velocity, fIndex);
-            if (velocity && IsResourceReady(FG_ResourceType::Velocity, fIndex))
-            {
-                LOG_DEBUG("Velocity resource: {:X}", (size_t) velocity->GetResource());
-                dfgPrepare.motionVectors =
-                    ffxApiGetResourceDX12(velocity->GetResource(), GetFfxApiState(velocity->state));
-            }
-            else
-            {
-                LOG_ERROR("Velocity is missing");
-                _fgCommandList[fIndex]->Close();
-                return false;
-            }
+            LOG_DEBUG("Velocity resource: {:X}", (size_t) velocity->GetResource());
+            dfgPrepare.motionVectors = ffxApiGetResourceDX12(velocity->GetResource(), GetFfxApiState(velocity->state));
+        }
+        else
+        {
+            LOG_ERROR("Velocity is missing");
+            _fgCommandList[fIndex]->Close();
+            return false;
         }
 
+        if (depth != nullptr && IsResourceReady(FG_ResourceType::Depth, fIndex))
         {
-            auto depth = GetResource(FG_ResourceType::Depth, fIndex);
-
-            if (depth && IsResourceReady(FG_ResourceType::Depth, fIndex))
-            {
-                LOG_DEBUG("Depth resource: {:X}", (size_t) depth->GetResource());
-                dfgPrepare.depth = ffxApiGetResourceDX12(depth->GetResource(), GetFfxApiState(depth->state));
-            }
-            else
-            {
-                LOG_ERROR("Depth is missing");
-                _fgCommandList[fIndex]->Close();
-                return false;
-            }
-
-            if (state.currentFeature && state.activeFgInput == FGInput::Upscaler)
-                dfgPrepare.renderSize = { state.currentFeature->RenderWidth(), state.currentFeature->RenderHeight() };
-            else if (depth)
-                dfgPrepare.renderSize = { static_cast<uint32_t>(depth->width), depth->height };
-            else
-                dfgPrepare.renderSize = { dfgPrepare.depth.description.width, dfgPrepare.depth.description.height };
+            LOG_DEBUG("Depth resource: {:X}", (size_t) depth->GetResource());
+            dfgPrepare.depth = ffxApiGetResourceDX12(depth->GetResource(), GetFfxApiState(depth->state));
         }
+        else
+        {
+            LOG_ERROR("Depth is missing");
+            _fgCommandList[fIndex]->Close();
+            return false;
+        }
+
+        if (state.currentFeature && state.activeFgInput == FGInput::Upscaler)
+            dfgPrepare.renderSize = { state.currentFeature->RenderWidth(), state.currentFeature->RenderHeight() };
+        else if (depth != nullptr)
+            dfgPrepare.renderSize = { static_cast<uint32_t>(depth->width), depth->height };
+        else
+            dfgPrepare.renderSize = { dfgPrepare.depth.description.width, dfgPrepare.depth.description.height };
 
         dfgPrepare.jitterOffset.x = _jitterX[fIndex];
         dfgPrepare.jitterOffset.y = _jitterY[fIndex];
@@ -641,259 +596,29 @@ bool FSRFG_Dx12::Dispatch()
     return dispatchResult;
 }
 
-void InterpolateCameraBasis(const float cameraUp[3], const float cameraRight[3], const float cameraForward[3],
-                            const float cameraPrevUp[3], const float cameraPrevRight[3],
-                            const float cameraPrevForward[3], float t, float outUp[3], float outRight[3],
-                            float outForward[3])
-{
-    t = std::clamp(t, 0.0f, 1.0f);
-
-    const XMVECTOR up0 = XMVector3Normalize(XMLoadFloat3(reinterpret_cast<const XMFLOAT3*>(cameraUp)));
-    const XMVECTOR right0 = XMVector3Normalize(XMLoadFloat3(reinterpret_cast<const XMFLOAT3*>(cameraRight)));
-    const XMVECTOR forward0 = XMVector3Normalize(XMLoadFloat3(reinterpret_cast<const XMFLOAT3*>(cameraForward)));
-
-    const XMVECTOR up1 = XMVector3Normalize(XMLoadFloat3(reinterpret_cast<const XMFLOAT3*>(cameraPrevUp)));
-    const XMVECTOR right1 = XMVector3Normalize(XMLoadFloat3(reinterpret_cast<const XMFLOAT3*>(cameraPrevRight)));
-    const XMVECTOR forward1 = XMVector3Normalize(XMLoadFloat3(reinterpret_cast<const XMFLOAT3*>(cameraPrevForward)));
-
-    const XMMATRIX m0 =
-        XMMatrixSet(XMVectorGetX(right0), XMVectorGetX(up0), XMVectorGetX(forward0), 0.0f, XMVectorGetY(right0),
-                    XMVectorGetY(up0), XMVectorGetY(forward0), 0.0f, XMVectorGetZ(right0), XMVectorGetZ(up0),
-                    XMVectorGetZ(forward0), 0.0f, 0.0f, 0.0f, 0.0f, 1.0f);
-
-    const XMMATRIX m1 =
-        XMMatrixSet(XMVectorGetX(right1), XMVectorGetX(up1), XMVectorGetX(forward1), 0.0f, XMVectorGetY(right1),
-                    XMVectorGetY(up1), XMVectorGetY(forward1), 0.0f, XMVectorGetZ(right1), XMVectorGetZ(up1),
-                    XMVectorGetZ(forward1), 0.0f, 0.0f, 0.0f, 0.0f, 1.0f);
-
-    XMVECTOR q0 = XMQuaternionRotationMatrix(m0);
-    XMVECTOR q1 = XMQuaternionRotationMatrix(m1);
-
-    if (XMVectorGetX(XMVector4Dot(q0, q1)) < 0.0f)
-        q1 = XMVectorNegate(q1);
-
-    const XMVECTOR q = XMQuaternionSlerp(q0, q1, t);
-
-    const XMMATRIX result = XMMatrixRotationQuaternion(q);
-
-    const XMVECTOR right =
-        XMVectorSet(XMVectorGetX(result.r[0]), XMVectorGetX(result.r[1]), XMVectorGetX(result.r[2]), 0.0f);
-    const XMVECTOR up =
-        XMVectorSet(XMVectorGetY(result.r[0]), XMVectorGetY(result.r[1]), XMVectorGetY(result.r[2]), 0.0f);
-    const XMVECTOR forward =
-        XMVectorSet(XMVectorGetZ(result.r[0]), XMVectorGetZ(result.r[1]), XMVectorGetZ(result.r[2]), 0.0f);
-
-    XMStoreFloat3(reinterpret_cast<XMFLOAT3*>(outRight), right);
-    XMStoreFloat3(reinterpret_cast<XMFLOAT3*>(outUp), up);
-    XMStoreFloat3(reinterpret_cast<XMFLOAT3*>(outForward), forward);
-}
-
-ffxReturnCode_t FSRFG_Dx12::PresentCallback(ffxCallbackDescFrameGenerationPresent* params)
-{
-    LOG_TRACE("frameID: {}, isGeneratedFrame: {}", params->frameID, params->isGeneratedFrame);
-
-    // It goes:
-    // frame 1, generated true  so (0 -> 1)
-    // frame 1, generated false
-    // frame 2, generated true  so (1 -> 2)
-    // frame 2, generated false
-
-    auto fIndex = params->frameID % BUFFER_COUNT;
-    auto cmdList = (ID3D12GraphicsCommandList*) params->commandList;
-
-    std::lock_guard<std::mutex> callbackLock(_callbackResourceMutex);
-
-    auto mouseDeltaSimToSim = InputCollection::getInstance().readSimsDelta(_frameCount);
-    auto mouseDeltaSinceSim = InputCollection::getInstance().readDeltaSinceSim(_frameCount);
-    LOG_DEBUG("pre mouseDeltaSinceSim: x:{}, y:{}", mouseDeltaSinceSim.x, mouseDeltaSinceSim.y);
-
-    if (params->isGeneratedFrame)
-    {
-        _deltaSimToFake[fIndex] = { mouseDeltaSinceSim, Util::GetTimestamp() };
-
-        _timeSinceSimStart = _deltaSimToFake[fIndex].second - mouseDeltaSinceSim.startTimestampNs;
-        LOG_DEBUG("_timeSinceSimStart :{}", (float) _timeSinceSimStart / 1'000'000);
-
-        mouseDeltaSimToSim = InputCollection::getInstance().readSimsDelta(_frameCount);
-        mouseDeltaSinceSim = InputCollection::getInstance().readDeltaSinceSim(_frameCount - 1);
-
-        // Half the motion already shown
-        mouseDeltaSinceSim -= mouseDeltaSimToSim / 2;
-    }
-    else if (_deltaSimToFake[fIndex].second != 0)
-    {
-        // We ignore the read mouseDeltaSinceSim
-
-        auto& deltaToPrevFake = _deltaSimToFake[fIndex];
-        auto timeDiffPrev = (double) (deltaToPrevFake.second - deltaToPrevFake.first.startTimestampNs) / 1'000'000;
-        auto timeDeltaFromFake = (double) (Util::GetTimestamp() - deltaToPrevFake.second) / 1'000'000;
-
-        // we dont have mouse data for the "_ftDelta[fIndex] / 2" that happens after this function is called but
-        // before the image is presented
-        auto timeDiffCurrent = timeDiffPrev + _ftDelta[fIndex] / 2 - timeDeltaFromFake;
-        // auto timeDiffCurrent = timeDiffPrev + _ftDelta[fIndex] / 2;
-
-        double ratio = timeDiffCurrent / timeDiffPrev;
-        mouseDeltaSinceSim *= ratio;
-        // mouseDeltaSinceSim = deltaToPrevFake.first * ratio;
-
-        _deltaSimToFake[fIndex].second = 0;
-    }
-
-    LOG_DEBUG("post mouseDeltaSinceSim: x:{}, y:{}", mouseDeltaSinceSim.x, mouseDeltaSinceSim.y);
-
-    auto hudless = GetResource(FG_ResourceType::HudlessColor, (int) fIndex);
-    auto depth = GetResource(FG_ResourceType::Depth, (int) fIndex);
-    if (depth && depth->copy && hudless && hudless->copy)
-    {
-        if (_reproject.get() == nullptr)
-        {
-            _reproject = std::make_unique<Reproject_Dx12>("Reproject", _device);
-        }
-
-        if (_reproject->IsInit())
-        {
-            auto previousIndex = (fIndex + BUFFER_COUNT - 1) % BUFFER_COUNT;
-
-            ReprojectionParams reprojectionParams {};
-
-            FilloutData data {};
-            data.diffThreshold = 0.01f;
-
-            // TODO: change something about this
-            // FSRFG calls PresentCallback quickly back to back
-            // Maybe try creating a difference between fake frame's mouseDeltaSinceSim and real frame's
-            // mouseDeltaSinceSim and using that
-            data.mouseDeltaSinceSim = mouseDeltaSinceSim;
-            data.mouseDeltaSimToSim = mouseDeltaSimToSim;
-
-            data.screenWidth = (uint32_t) _interpolationWidth[fIndex];
-            data.screenHeight = (uint32_t) _interpolationHeight[fIndex];
-            data.invertedDepth = _constants.flags[FG_Flags::InvertedDepth];
-            data.fakeFrame = params->isGeneratedFrame;
-
-            data.cameraVFov = _cameraVFov[fIndex];
-            data.cameraAspectRatio = _cameraAspectRatio[fIndex];
-
-            if (params->isGeneratedFrame)
-            {
-                auto lerpDistance = 0.5f;
-
-                // Half way between real frames
-                // No cameraPrevForward, reprojection should skip trying to calibrate based on that frame
-                InterpolateCameraBasis(_cameraUp[fIndex], _cameraRight[fIndex], _cameraForward[fIndex],
-                                       _cameraUp[previousIndex], _cameraRight[previousIndex],
-                                       _cameraForward[previousIndex], lerpDistance, data.cameraUp, data.cameraRight,
-                                       data.cameraForward);
-
-                // data.mouseDeltaSinceSim.x -= data.mouseDeltaSimToSim.x / 2;
-                // data.mouseDeltaSinceSim.y -= data.mouseDeltaSimToSim.y / 2;
-            }
-            else
-            {
-                std::memcpy(data.cameraUp, _cameraUp[fIndex], 3 * sizeof(float));
-                std::memcpy(data.cameraRight, _cameraRight[fIndex], 3 * sizeof(float));
-                std::memcpy(data.cameraForward, _cameraForward[fIndex], 3 * sizeof(float));
-                std::memcpy(data.cameraPrevForward, _cameraForward[previousIndex], 3 * sizeof(float));
-            }
-
-            _reproject->FilloutStruct(data, reprojectionParams);
-            //_reproject->Dispatch(cmdList, reprojectionParams, (ID3D12Resource*) params->currentBackBuffer.resource,
-            //                     GetD3D12State((FfxApiResourceState) params->currentBackBuffer.state), hudless->copy,
-            //                     D3D12_RESOURCE_STATE_COPY_DEST, depth->copy, D3D12_RESOURCE_STATE_COPY_DEST);
-
-            // Can be either a fake or real present
-            auto backBufferState = GetD3D12State((FfxApiResourceState) params->currentBackBuffer.state);
-            auto backBufferResource = (ID3D12Resource*) params->currentBackBuffer.resource;
-
-            // Last real present
-            auto realPresentState = D3D12_RESOURCE_STATE_COPY_DEST;
-            auto realPresentResource = _resourceCopy[fIndex][FG_ResourceType::Color];
-
-            _reproject->Dispatch(cmdList, reprojectionParams, realPresentResource, realPresentState, backBufferResource,
-                                 backBufferState, hudless->copy, D3D12_RESOURCE_STATE_COPY_DEST, depth->copy,
-                                 D3D12_RESOURCE_STATE_COPY_DEST);
-
-            auto output = (ID3D12Resource*) params->outputSwapChainBuffer.resource;
-            auto outputState = GetD3D12State((FfxApiResourceState) params->outputSwapChainBuffer.state);
-            ResourceBarrier(cmdList, output, outputState, D3D12_RESOURCE_STATE_COPY_DEST);
-
-            // GetCurrentBuffer already in D3D12_RESOURCE_STATE_COPY_SOURCE
-            cmdList->CopyResource(output, _reproject->GetCurrentBuffer());
-
-            ResourceBarrier(cmdList, output, D3D12_RESOURCE_STATE_COPY_DEST, outputState);
-        }
-    }
-
-    return FFX_API_RETURN_OK;
-}
-
 ffxReturnCode_t FSRFG_Dx12::DispatchCallback(ffxDispatchDescFrameGeneration* params)
 {
     const int fIndex = params->frameID % BUFFER_COUNT;
-    auto cmdList = (ID3D12GraphicsCommandList*) params->commandList;
 
     auto& state = State::Instance();
-
-    std::unique_lock<std::mutex> callbackLock(_callbackResourceMutex);
-
-    // Skipped while FG is off, the copy would be recreated right after ReleaseResourceCopies frees it
-    if (cmdList && _reprojectionActive && Config::Instance()->IsFGEnabled())
-    {
-        // Save the original game image with UI for later so that we can compose back the UI
-        ID3D12Resource* copyOutput = nullptr;
-        auto type = FG_ResourceType::Color;
-
-        if (_resourceCopy[fIndex].contains(type))
-            copyOutput = _resourceCopy[fIndex].at(type);
-
-        auto presentColorState = GetD3D12State((FfxApiResourceState) params->presentColor.state);
-        auto presentColorResource = (ID3D12Resource*) params->presentColor.resource;
-
-        if (!CopyResource(cmdList, presentColorResource, &copyOutput, presentColorState))
-        {
-            LOG_ERROR("{}, CopyResource error!", magic_enum::enum_name(type));
-            return false;
-        }
-
-        copyOutput->SetName(std::format(L"_resourceCopy[{}][{}]", fIndex, (UINT) type).c_str());
-
-        _resourceCopy[fIndex][type] = copyOutput;
-
-        LOG_TRACE("Made a copy: {:X} of presentColor", (size_t) copyOutput);
-
-        // For reprojection we need to interpolate without UI
-        auto hudlessResource = _resourceCopy[fIndex][FG_ResourceType::HudlessColor];
-        auto hudlessState = D3D12_RESOURCE_STATE_COPY_DEST;
-        if (hudlessResource)
-        {
-            ResourceBarrier(cmdList, presentColorResource, presentColorState, D3D12_RESOURCE_STATE_COPY_DEST);
-            ResourceBarrier(cmdList, hudlessResource, hudlessState, D3D12_RESOURCE_STATE_COPY_SOURCE);
-
-            cmdList->CopyResource(presentColorResource, hudlessResource);
-
-            ResourceBarrier(cmdList, presentColorResource, D3D12_RESOURCE_STATE_COPY_DEST, presentColorState);
-            ResourceBarrier(cmdList, hudlessResource, D3D12_RESOURCE_STATE_COPY_SOURCE, hudlessState);
-        }
-    }
 
     if (!Config::Instance()->FGSkipReset.value_or_default())
         params->reset = (_reset[fIndex] != 0);
     else
         params->reset = 0;
 
-    LOG_DEBUG("frameID: {}, commandList: {:X}, numGeneratedFrames: {}", params->frameID, (size_t) cmdList,
+    LOG_DEBUG("frameID: {}, commandList: {:X}, numGeneratedFrames: {}", params->frameID, (size_t) params->commandList,
               params->numGeneratedFrames);
 
     // check for status
-    if (!Config::Instance()->IsFGEnabled() || _fgContext == nullptr || state.scChanged)
+    if (!Config::Instance()->FGEnabled.value_or_default() || _fgContext == nullptr || state.SCchanged)
     {
         LOG_WARN("Cancel async dispatch");
         params->numGeneratedFrames = 0;
     }
 
     // If fg is active but upscaling paused
-    if ((state.currentFeature == nullptr && state.activeFgInput == FGInput::Upscaler) || state.fgChanged ||
+    if ((state.currentFeature == nullptr && state.activeFgInput == FGInput::Upscaler) || state.FGchanged ||
         fIndex < 0 || !IsActive() || (state.currentFeature && state.currentFeature->FrameCount() == 0))
     {
         LOG_WARN("Upscaling paused! frameID: {}", params->frameID);
@@ -921,8 +646,8 @@ ffxReturnCode_t FSRFG_Dx12::DispatchCallback(ffxDispatchDescFrameGeneration* par
     //    params->numGeneratedFrames = 0;
     //    _lastFrameId = params->frameID;
 
-    //    state.fgChanged = true;
-    //    state.scChanged = true;
+    //    state.FGchanged = true;
+    //    state.SCchanged = true;
 
     //    return FFX_API_RETURN_OK;
     //}
@@ -942,17 +667,14 @@ ffxReturnCode_t FSRFG_Dx12::DispatchCallback(ffxDispatchDescFrameGeneration* par
             params->numGeneratedFrames = 0;
             _lastFrameId = params->frameID;
 
-            state.fgChanged = true;
-            state.scChanged = true;
+            state.FGchanged = true;
+            state.SCchanged = true;
 
             return FFX_API_RETURN_OK;
         }
     }
 
-    bool applyHudCutoff = Config::Instance()->FGHudCutoff.value_or_default() > 0.0f ||
-                          State::Instance().gameQuirks & GameQuirk::FSRFGHudlessMismatchFixup;
-
-    if ((applyHudCutoff || State::Instance().fgHudlessCompare) && !lastFGDisableHudless)
+    if (State::Instance().gameQuirks & GameQuirk::FSRFGHudlessMismatchFixup && !lastFGDisableHudless)
     {
         auto presentWithHud = (ID3D12Resource*) params->presentColor.resource;
         auto hudlessResource = _resourceCopy[fIndex][FG_ResourceType::HudlessColor];
@@ -971,74 +693,29 @@ ffxReturnCode_t FSRFG_Dx12::DispatchCallback(ffxDispatchDescFrameGeneration* par
 
         if (presentWithHud && hudlessResource)
         {
-            // Do not blindly trust the cached _device for callback helper creation
-            ID3D12Device* callbackDevice = nullptr;
-            HRESULT callbackDeviceResult = E_POINTER;
+            auto cmdList = (ID3D12GraphicsCommandList*) params->commandList;
 
-            if (cmdList != nullptr)
-                callbackDeviceResult = cmdList->GetDevice(IID_PPV_ARGS(&callbackDevice));
-
-            if (callbackDevice == nullptr && presentWithHud != nullptr)
-                callbackDeviceResult = presentWithHud->GetDevice(IID_PPV_ARGS(&callbackDevice));
-
-            if (callbackDevice == nullptr)
+            if (_hudCopy[fIndex].get() == nullptr)
             {
-                LOG_ERROR("FSRFG HUD helper failed to resolve callback D3D12 device: {:X}",
-                          (UINT) callbackDeviceResult);
+                _hudCopy[fIndex] = std::make_unique<HudCopy_Dx12>("HudCopy", _device);
             }
 
-            if (applyHudCutoff)
+            if (auto hudCopy = _hudCopy[fIndex].get(); hudCopy && hudCopy->IsInit())
             {
-                if (_hudCopy.get() == nullptr && callbackDevice != nullptr)
-                {
-                    _hudCopy = std::make_unique<HudCopy_Dx12>("HudCopy", callbackDevice);
-                }
+                // In Cyberprank - DLSSG has noise issues, FSR FG has noise + vignetting
+                // In Death Stranding 2 - DLSSG has wrong colormapping it seems, FSR FG is fine
+                const bool isCyberpunk = State::Instance().gameQuirks[GameQuirk::CyberpunkHudlessState];
+                float hudDetectionThreshold = 0.03f;
 
-                if (auto hudCopy = _hudCopy.get(); hudCopy && hudCopy->IsInit())
-                {
-                    // In Cyberprank - DLSSG has noise issues, FSR FG has noise + vignetting
-                    // In Death Stranding 2 - DLSSG has wrong colormapping it seems, FSR FG is fine
-                    const bool isCyberpunk = State::Instance().gameQuirks[GameQuirk::CyberpunkHudlessState];
-                    float hudDetectionThreshold = 0.03f;
+                if (isCyberpunk && State::Instance().activeFgInput != FGInput::FSRFG)
+                    hudDetectionThreshold = 0.01f;
 
-                    if (isCyberpunk && State::Instance().activeFgInput != FGInput::FSRFG)
-                        hudDetectionThreshold = 0.01f;
-
-                    if (Config::Instance()->FGHudCutoff.value_or_default() > 0.0f)
-                        hudDetectionThreshold = Config::Instance()->FGHudCutoff.value_or_default() / 10.0f;
-
-                    hudCopy->Dispatch(cmdList, hudlessResource, presentWithHud, hudlessState,
-                                      GetD3D12State((FfxApiResourceState) params->presentColor.state),
-                                      hudDetectionThreshold);
-                }
+                hudCopy->Dispatch(_device, cmdList, hudlessResource, presentWithHud, hudlessState,
+                                  GetD3D12State((FfxApiResourceState) params->presentColor.state),
+                                  hudDetectionThreshold);
             }
-
-            if (State::Instance().fgHudlessCompare)
-            {
-                if (hudlessResource != nullptr)
-                {
-                    if (_hudlessCompareCompute.get() == nullptr && callbackDevice != nullptr)
-                    {
-                        LOG_DEBUG("Creating HudlessCompareCompute on callback device {:X} (cached {:X})",
-                                  (size_t) callbackDevice, (size_t) _device);
-                        _hudlessCompareCompute = std::make_unique<HCC_Dx12>("HudlessCompareCompute", callbackDevice);
-                    }
-
-                    if (auto hudlessCompareCompute = _hudlessCompareCompute.get();
-                        hudlessCompareCompute && hudlessCompareCompute->IsInit())
-                    {
-                        hudlessCompareCompute->Dispatch(
-                            cmdList, hudlessResource, presentWithHud, hudlessState,
-                            GetD3D12State((FfxApiResourceState) params->presentColor.state));
-                    }
-                }
-            }
-
-            SAFE_RELEASE(callbackDevice);
         }
     }
-
-    callbackLock.unlock();
 
     auto dispatchResult = FfxApiProxy::D3D12_Dispatch(&_fgContext, &params->header);
     LOG_DEBUG("D3D12_Dispatch result: {}, fIndex: {}", (UINT) dispatchResult, fIndex);
@@ -1092,19 +769,55 @@ bool FSRFG_Dx12::Shutdown()
     Deactivate();
 
     if (_swapChainContext != nullptr)
-    {
-        if (ReleaseSwapchain(_hwnd))
-            State::Instance().currentFGSwapchain = nullptr;
-    }
+        ReleaseSwapchain(_hwnd);
 
     ReleaseObjects();
 
     return true;
 }
 
-bool FSRFG_Dx12::CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQueue* cmdQueue,
-                                         DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** swapChain)
+bool FSRFG_Dx12::CreateSwapchain(IDXGIFactory* factory, ID3D12CommandQueue* cmdQueue, DXGI_SWAP_CHAIN_DESC* desc,
+                                 IDXGISwapChain** swapChain, bool readyToRelease)
 {
+    if (State::Instance().currentFGSwapchain != nullptr && _hwnd == desc->OutputWindow)
+    {
+        if (Config::Instance()->FGPreserveSwapChain.value_or_default())
+        {
+            LOG_WARN("FG swapchain already created for the same output window!");
+            auto result = State::Instance().currentFGSwapchain->ResizeBuffers(
+                              desc->BufferCount, desc->BufferDesc.Width, desc->BufferDesc.Height,
+                              desc->BufferDesc.Format, desc->Flags) == S_OK;
+
+            *swapChain = State::Instance().currentFGSwapchain;
+            return result;
+        }
+        // Game is creating new swapchain without releasing old one,
+        // we need to release it to avoid errors
+        else if (readyToRelease)
+        {
+            LOG_INFO("Releasing old swapchain");
+            ReleaseSwapchain(_hwnd);
+
+            // Not sure why but XeFG sometimes doesn't release the swapchain properly
+            // maybe needed for FSR-FG too, so added it here
+            // so we force release it here to be able to recreate swapchain for same hwnd
+            if (State::Instance().currentRealSwapchain != nullptr)
+            {
+                UINT release = 0;
+                do
+                {
+                    release = State::Instance().currentRealSwapchain->Release();
+                    LOG_DEBUG("Releasing swapchain, ref count: {}", release);
+                } while (release > 0);
+            }
+        }
+        else
+        {
+            LOG_WARN("FG swapchain already exists for the same output window and is not ready to release!");
+            return false;
+        }
+    }
+
     IDXGIFactory* realFactory = nullptr;
     ID3D12CommandQueue* realQueue = nullptr;
 
@@ -1143,10 +856,48 @@ bool FSRFG_Dx12::CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQue
     return false;
 }
 
-bool FSRFG_Dx12::CreateSwapchain1Internal(IDXGIFactory* factory, ID3D12CommandQueue* cmdQueue, HWND hwnd,
-                                          DXGI_SWAP_CHAIN_DESC1* desc, DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc,
-                                          IDXGISwapChain1** swapChain)
+bool FSRFG_Dx12::CreateSwapchain1(IDXGIFactory* factory, ID3D12CommandQueue* cmdQueue, HWND hwnd,
+                                  DXGI_SWAP_CHAIN_DESC1* desc, DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc,
+                                  IDXGISwapChain1** swapChain, bool readyToRelease)
 {
+    if (State::Instance().currentFGSwapchain != nullptr && _hwnd == hwnd)
+    {
+        if (Config::Instance()->FGPreserveSwapChain.value_or_default())
+        {
+            LOG_WARN("XeFG swapchain already created for the same output window!");
+            auto result = State::Instance().currentFGSwapchain->ResizeBuffers(
+                              desc->BufferCount, desc->Width, desc->Height, desc->Format, desc->Flags) == S_OK;
+
+            *swapChain = (IDXGISwapChain1*) State::Instance().currentFGSwapchain;
+            return result;
+        }
+        // Game is creating new swapchain without releasing old one,
+        // we need to release it to avoid errors
+        else if (readyToRelease)
+        {
+            LOG_INFO("Releasing old swapchain");
+            ReleaseSwapchain(_hwnd);
+
+            // Not sure why but XeFG sometimes doesn't release the swapchain properly
+            // maybe needed for FSR-FG too, so added it here
+            // so we force release it here to be able to recreate swapchain for same hwnd
+            if (State::Instance().currentRealSwapchain != nullptr)
+            {
+                UINT release = 0;
+                do
+                {
+                    release = State::Instance().currentRealSwapchain->Release();
+                    LOG_DEBUG("Releasing swapchain, ref count: {}", release);
+                } while (release > 0);
+            }
+        }
+        else
+        {
+            LOG_WARN("FG swapchain already exists for the same output window and is not ready to release!");
+            return false;
+        }
+    }
+
     IDXGIFactory* realFactory = nullptr;
     ID3D12CommandQueue* realQueue = nullptr;
 
@@ -1212,17 +963,19 @@ bool FSRFG_Dx12::ReleaseSwapchain(HWND hwnd)
     if (_fgContext != nullptr)
         DestroyFGContext();
 
-    if (!State::Instance().isShuttingDown)
+    if (!Config::Instance()->FGPreserveSwapChain.value_or_default())
     {
-        State::Instance().currentFGSwapchain = nullptr;
-
-        if (_swapChainContext != nullptr)
+        if (!State::Instance().isShuttingDown)
         {
-            auto result = FfxApiProxy::D3D12_DestroyContext(&_swapChainContext, nullptr);
-            LOG_INFO("Destroy Ffx Swapchain Result: {}({})", result, FfxApiProxy::ReturnCodeToString(result));
-        }
+            if (_swapChainContext != nullptr)
+            {
+                auto result = FfxApiProxy::D3D12_DestroyContext(&_swapChainContext, nullptr);
+                LOG_INFO("Destroy Ffx Swapchain Result: {}({})", result, FfxApiProxy::ReturnCodeToString(result));
+            }
 
-        _swapChainContext = nullptr;
+            _swapChainContext = nullptr;
+            State::Instance().currentFGSwapchain = nullptr;
+        }
     }
 
     if (Config::Instance()->FGUseMutexForSwapchain.value_or_default())
@@ -1298,8 +1051,7 @@ void FSRFG_Dx12::CreateContext(ID3D12Device* device, FG_Constants& fgConstants)
 
     // use swapchain buffer info
     DXGI_SWAP_CHAIN_DESC desc {};
-    if ((_swapChain != nullptr && _swapChain->GetDesc(&desc) == S_OK) ||
-        State::Instance().currentSwapchain->GetDesc(&desc) == S_OK)
+    if (State::Instance().currentSwapchain->GetDesc(&desc) == S_OK)
     {
         createFg.displaySize = { desc.BufferDesc.Width, desc.BufferDesc.Height };
 
@@ -1361,6 +1113,9 @@ void FSRFG_Dx12::CreateContext(ID3D12Device* device, FG_Constants& fgConstants)
     }
 
     {
+        ScopedSkipSpoofing skipSpoofing {};
+        ScopedSkipHeapCapture skipHeapCapture {};
+
         // Currently 0 is non-ML FG and 1 is ML FG
         if (Config::Instance()->FfxFGIndex.value_or_default() < 0 ||
             Config::Instance()->FfxFGIndex.value_or_default() >= State::Instance().ffxFGVersionIds.size())
@@ -1369,16 +1124,10 @@ void FSRFG_Dx12::CreateContext(ID3D12Device* device, FG_Constants& fgConstants)
         ffxOverrideVersion override = { 0 };
         override.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
         override.versionId = State::Instance().ffxFGVersionIds[Config::Instance()->FfxFGIndex.value_or_default()];
+        backendDesc.header.pNext = &override.header;
 
-        if (_linkedHudlesDesc)
-            hudlessDesc.header.pNext = &override.header;
-        else
-            backendDesc.header.pNext = &override.header;
+        ParseVersion(State::Instance().ffxFGVersionNames[Config::Instance()->FfxFGIndex.value_or_default()], &_version);
 
-        _version.parse_version(State::Instance().ffxFGVersionNames[Config::Instance()->FfxFGIndex.value_or_default()]);
-
-        ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
-        ScopedSkipHeapCapture skipHeapCapture {};
         ffxReturnCode_t retCode = FfxApiProxy::D3D12_CreateContext(&_fgContext, &createFg.header, nullptr);
 
         LOG_INFO("D3D12_CreateContext result: {:X}", retCode);
@@ -1428,8 +1177,6 @@ void FSRFG_Dx12::Deactivate()
             else
                 LOG_ERROR("_uiCommandList[{}]->Close() error: {:X}", fIndex, (UINT) closeResult);
 
-            _gameCommandQueue->Signal(_uiFence, _uiAllocatorFenceValues[fIndex]);
-
             _uiCommandListResetted[fIndex] = false;
         }
 
@@ -1462,27 +1209,9 @@ void FSRFG_Dx12::Deactivate()
     }
 }
 
-template <auto Flag> void CheckAndUpdateFlag(auto currentFlags, std::string_view flagName)
-{
-    static std::optional<bool> lastState;
-    bool currentState = static_cast<bool>(currentFlags & Flag);
-
-    if (lastState.has_value() && *lastState != currentState)
-    {
-        LOG_DEBUG("{} changed: {}", flagName, currentState);
-
-        State::Instance().fgChanged = true;
-        State::Instance().scChanged = true;
-    }
-
-    lastState = currentState;
-}
-
 void FSRFG_Dx12::EvaluateState(ID3D12Device* device, FG_Constants& fgConstants)
 {
     LOG_FUNC();
-
-    OwnedLockGuard lock(Mutex, 555);
 
     _constants = fgConstants;
 
@@ -1499,23 +1228,27 @@ void FSRFG_Dx12::EvaluateState(ID3D12Device* device, FG_Constants& fgConstants)
         return;
     }
 
-    // DLSSG can update flags in eval, FSR FG requires context recreation for this
-    CheckAndUpdateFlag<FG_Flags::Hdr>(fgConstants.flags, "HDR");
-    CheckAndUpdateFlag<FG_Flags::InfiniteDepth>(fgConstants.flags, "Infinite Depth");
-    CheckAndUpdateFlag<FG_Flags::InvertedDepth>(fgConstants.flags, "Inverted Depth");
-    CheckAndUpdateFlag<FG_Flags::JitteredMVs>(fgConstants.flags, "Jittered MVs");
-    CheckAndUpdateFlag<FG_Flags::DisplayResolutionMVs>(fgConstants.flags, "Display Resolution MVs");
+    static bool lastInfiniteDepth = false;
+    bool currentInfiniteDepth = static_cast<bool>(fgConstants.flags & FG_Flags::InfiniteDepth);
+    if (lastInfiniteDepth != currentInfiniteDepth)
+    {
+        lastInfiniteDepth = currentInfiniteDepth;
+        LOG_DEBUG("Infinite Depth changed: {}", currentInfiniteDepth);
+
+        State::Instance().FGchanged = true;
+        State::Instance().SCchanged = true;
+    }
 
     if (_maxRenderWidth != 0 && _maxRenderHeight != 0 && IsActive() && !IsPaused() &&
         (fgConstants.displayWidth > _maxRenderWidth || fgConstants.displayHeight > _maxRenderHeight))
 
     {
-        State::Instance().fgChanged = true;
-        State::Instance().scChanged = true;
+        State::Instance().FGchanged = true;
+        State::Instance().SCchanged = true;
     }
 
     // If FG Enabled from menu
-    if (Config::Instance()->IsFGEnabled())
+    if (Config::Instance()->FGEnabled.value_or_default())
     {
         // If FG context is nullptr
         if (_fgContext == nullptr)
@@ -1527,7 +1260,7 @@ void FSRFG_Dx12::EvaluateState(ID3D12Device* device, FG_Constants& fgConstants)
             UpdateTarget();
         }
         // If there is a change deactivate it
-        else if (State::Instance().fgChanged)
+        else if (State::Instance().FGchanged)
         {
             Deactivate();
 
@@ -1535,39 +1268,28 @@ void FSRFG_Dx12::EvaluateState(ID3D12Device* device, FG_Constants& fgConstants)
             UpdateTarget();
 
             // Destroy if Swapchain has a change destroy FG Context too
-            if (State::Instance().scChanged)
+            if (State::Instance().SCchanged)
                 DestroyFGContext();
         }
 
         if (_fgContext != nullptr && State::Instance().activeFgInput == FGInput::Upscaler && !IsPaused() && !IsActive())
             Activate();
     }
-    else
+    else if (IsActive())
     {
-        if (IsActive())
-        {
-            Deactivate();
+        Deactivate();
 
-            State::Instance().clearCapturedHudlesses = true;
-            Hudfix_Dx12::ResetCounters();
-            Hudfix_Dx11::ResetCounters();
-        }
-
-        // The change flags are cleared below, so a pending recreation (e.g. FFX FG version) must happen now
-        if (State::Instance().scChanged)
-            DestroyFGContext();
-
-        ReleaseResourceCopies();
+        State::Instance().ClearCapturedHudlesses = true;
+        Hudfix_Dx12::ResetCounters();
     }
 
-    if (State::Instance().fgChanged)
+    if (State::Instance().FGchanged)
     {
         LOG_DEBUG("FGchanged");
 
-        State::Instance().fgChanged = false;
+        State::Instance().FGchanged = false;
 
         Hudfix_Dx12::ResetCounters();
-        Hudfix_Dx11::ResetCounters();
 
         // Pause for 10 frames
         UpdateTarget();
@@ -1577,55 +1299,54 @@ void FSRFG_Dx12::EvaluateState(ID3D12Device* device, FG_Constants& fgConstants)
             Mutex.unlockThis(2);
     }
 
-    State::Instance().scChanged = false;
+    State::Instance().SCchanged = false;
 }
 
 void FSRFG_Dx12::ReleaseObjects()
 {
     for (size_t i = 0; i < BUFFER_COUNT; i++)
     {
-        SAFE_RELEASE(_fgCommandAllocator[i]);
-        SAFE_RELEASE(_fgCommandList[i]);
-        SAFE_RELEASE(_uiCommandAllocator[i]);
-        SAFE_RELEASE(_uiCommandList[i]);
-        SAFE_RELEASE(_scCommandAllocator[i]);
-        SAFE_RELEASE(_scCommandList[i]);
+        if (_fgCommandAllocator[i] != nullptr)
+        {
+            _fgCommandAllocator[i]->Release();
+            _fgCommandAllocator[i] = nullptr;
+        }
 
-        // Reset command list state
-        _scCommandListResetted[i] = false;
-        _scAllocatorFenceValues[i] = 0;
+        if (_fgCommandList[i] != nullptr)
+        {
+            _fgCommandList[i]->Release();
+            _fgCommandList[i] = nullptr;
+        }
 
-        _uiCommandListResetted[i] = false;
-        _uiAllocatorFenceValues[i] = 0;
+        if (_uiCommandAllocator[i] != nullptr)
+        {
+            _uiCommandAllocator[i]->Release();
+            _uiCommandAllocator[i] = nullptr;
+        }
+
+        if (_uiCommandList[i] != nullptr)
+        {
+            _uiCommandList[i]->Release();
+            _uiCommandList[i] = nullptr;
+        }
+
+        if (_scCommandAllocator[i] != nullptr)
+        {
+            _scCommandAllocator[i]->Release();
+            _scCommandAllocator[i] = nullptr;
+        }
+
+        if (_scCommandList[i] != nullptr)
+        {
+            _scCommandList[i]->Release();
+            _scCommandList[i] = nullptr;
+        }
     }
 
     _renderUI.reset();
     _hudlessCompare.reset();
     _mvFlip.reset();
     _depthFlip.reset();
-
-    ReleaseResourceCopies();
-}
-
-void FSRFG_Dx12::ReleaseResourceCopies()
-{
-    std::lock_guard<std::mutex> callbackLock(_callbackResourceMutex);
-
-    for (size_t i = 0; i < BUFFER_COUNT; i++)
-    {
-        // Destructors defer the release of their buffers
-        _hudlessTransfer[i].reset();
-        _uiTransfer[i].reset();
-        DeferredRelease::Release(_hudlessCopyResource[i]);
-    }
-
-    _hudCopy.reset();
-    _hudlessCompareCompute.reset();
-
-    // Disables raw input hooks on destroy
-    _reproject.reset();
-
-    IFGFeature_Dx12::ReleaseResourceCopies();
 }
 
 bool FSRFG_Dx12::ExecuteCommandList(int index)
@@ -1796,6 +1517,11 @@ bool FSRFG_Dx12::SetResource(Dx12Resource* inputResource)
 
     SetResourceReady(type, fIndex);
 
+    // if (inputResource->validity == FG_ResourceValidity::UntilPresent)
+    //     SetResourceReady(type, fIndex);
+    // else
+    //     ResTrack_Dx12::SetResourceCmdList(type, inputResource->cmdList);
+
     LOG_TRACE("_frameResources[{}][{}]: {:X}", fIndex, magic_enum::enum_name(type), (size_t) fResource->GetResource());
     return true;
 }
@@ -1821,13 +1547,6 @@ void FSRFG_Dx12::CreateObjects(ID3D12Device* InDevice)
         // FG
         for (size_t i = 0; i < BUFFER_COUNT; i++)
         {
-            // Reset command list state
-            _scCommandListResetted[i] = false;
-            _scAllocatorFenceValues[i] = 0;
-
-            _uiCommandListResetted[i] = false;
-            _uiAllocatorFenceValues[i] = 0;
-
             result =
                 InDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&_fgCommandAllocator[i]));
             if (result != S_OK)
@@ -1888,26 +1607,6 @@ void FSRFG_Dx12::CreateObjects(ID3D12Device* InDevice)
                 break;
             }
 
-            if (_uiFence == nullptr)
-            {
-                result = InDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&_uiFence));
-                if (FAILED(result))
-                {
-                    LOG_ERROR("Create UI fence failed: {:X}", (UINT) result);
-                    break;
-                }
-            }
-
-            if (_uiFenceEvent == nullptr)
-            {
-                _uiFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-                if (_uiFenceEvent == nullptr)
-                {
-                    LOG_ERROR("CreateEvent for UI fence failed");
-                    break;
-                }
-            }
-
             result =
                 InDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&_scCommandAllocator[i]));
             if (result != S_OK)
@@ -1937,26 +1636,6 @@ void FSRFG_Dx12::CreateObjects(ID3D12Device* InDevice)
                 LOG_ERROR("_scCommandList[{}]->Close: {:X}", i, (unsigned long) result);
                 break;
             }
-
-            if (_scFence == nullptr)
-            {
-                result = InDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&_scFence));
-                if (FAILED(result))
-                {
-                    LOG_ERROR("Create SC fence failed: {:X}", (UINT) result);
-                    break;
-                }
-            }
-
-            if (_scFenceEvent == nullptr)
-            {
-                _scFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-                if (_scFenceEvent == nullptr)
-                {
-                    LOG_ERROR("CreateEvent for SC fence failed");
-                    break;
-                }
-            }
         }
 
     } while (false);
@@ -1969,7 +1648,7 @@ bool FSRFG_Dx12::Present()
     if (Config::Instance()->FGDrawUIOverFG.value_or_default())
     {
         auto ui = GetResource(FG_ResourceType::UIColor, fIndex);
-        if (ui)
+        if (ui != nullptr)
         {
             LOG_DEBUG("UI[{}] resource: {:X}, copy: {}", fIndex, (size_t) ui->resource, (size_t) ui->copy);
             if (_renderUI.get() == nullptr)
@@ -1992,9 +1671,30 @@ bool FSRFG_Dx12::Present()
                 }
             }
         }
-        else if (!ui)
+        else if (ui == nullptr)
         {
             LOG_WARN("UI resource is nullptr");
+        }
+    }
+
+    if (IsActive() && !IsPaused() && State::Instance().FGHudlessCompare)
+    {
+        auto hudless = GetResource(FG_ResourceType::HudlessColor, fIndex);
+        if (hudless != nullptr)
+        {
+            if (_hudlessCompare.get() == nullptr)
+            {
+                _hudlessCompare = std::make_unique<HC_Dx12>("HudlessCompare", _device);
+            }
+            else
+            {
+                if (_hudlessCompare->IsInit())
+                {
+                    auto commandList = GetSCCommandList(fIndex);
+                    _hudlessCompare->Dispatch((IDXGISwapChain3*) _swapChain, commandList, hudless->GetResource(),
+                                              hudless->state);
+                }
+            }
         }
     }
 
@@ -2011,8 +1711,6 @@ bool FSRFG_Dx12::Present()
                 _gameCommandQueue->ExecuteCommandLists(1, (ID3D12CommandList**) &_uiCommandList[fIndex]);
             else
                 LOG_ERROR("_uiCommandList[{}]->Close() error: {:X}", fIndex, (UINT) closeResult);
-
-            _gameCommandQueue->Signal(_uiFence, _uiAllocatorFenceValues[fIndex]);
 
             _uiCommandListResetted[fIndex] = false;
         }

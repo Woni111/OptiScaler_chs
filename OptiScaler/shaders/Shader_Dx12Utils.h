@@ -2,7 +2,6 @@
 #include <d3dx/d3dx12.h>
 #include <vector>
 #include <stdexcept>
-#include <misc/DeferredRelease.h>
 
 class FrameDescriptorHeap
 {
@@ -117,43 +116,18 @@ class FrameDescriptorHeap
 
     void ReleaseHeaps()
     {
-        // Command lists in flight can still reference these
-        DeferredRelease::Release(heapCSU);
-        DeferredRelease::Release(heapRtv);
+        // Randomly crashing on release
+        // For now rely on OS to clean up on exit
+        // Need to check if it's about they are being use
+        // Also need to create shaders when they are used to prevent creating heaps when not used
+        return;
+
+        if (heapCSU)
+            heapCSU->Release();
+
+        if (heapRtv)
+            heapRtv->Release();
     }
 
     ~FrameDescriptorHeap() { ReleaseHeaps(); }
 };
-
-template <typename T>
-bool CreateConstantsBuffer(ID3D12Device* device, ID3D12Resource* constantBuffer, const T& constants,
-                           D3D12_CPU_DESCRIPTOR_HANDLE destDescriptor)
-{
-    // Copy the updated constant buffer data to the constant buffer resource
-    UINT8* pCBDataBegin;
-    CD3DX12_RANGE readRange(0, 0); // We do not intend to read from this resource on the CPU
-    auto result = constantBuffer->Map(0, &readRange, reinterpret_cast<void**>(&pCBDataBegin));
-
-    if (result != S_OK)
-    {
-        if (result == DXGI_ERROR_DEVICE_REMOVED && device != nullptr)
-            Util::GetDeviceRemovedReason(device);
-
-        return false;
-    }
-
-    memcpy(pCBDataBegin, &constants, sizeof(constants));
-    constantBuffer->Unmap(0, nullptr);
-
-    constexpr UINT alignTo = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1;
-    UINT alignedSize = (sizeof(constants) + alignTo) & ~alignTo;
-
-    // Create CBV for Constants
-    D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
-    cbvDesc.BufferLocation = constantBuffer->GetGPUVirtualAddress();
-    cbvDesc.SizeInBytes = alignedSize;
-
-    device->CreateConstantBufferView(&cbvDesc, destDescriptor);
-
-    return true;
-}

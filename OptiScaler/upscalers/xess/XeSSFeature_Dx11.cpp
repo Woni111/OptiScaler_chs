@@ -1,6 +1,5 @@
 #include <pch.h>
 #include "XeSSFeature_Dx11.h"
-#include <imgui/ImGuiNotify.hpp>
 
 static std::string ResultToString(xess_result_t result)
 {
@@ -46,34 +45,44 @@ static void XeSSLogCallback(const char* Message, xess_logging_level_t Level)
     spdlog::log((spdlog::level::level_enum) logLevel, "XeSSFeature::LogCallback XeSS Runtime ({0})", Message);
 }
 
-bool XeSSFeature_Dx11::InitInternal(ID3D11DeviceContext* InContext, NVSDK_NGX_Parameter* InParameters)
+bool XeSSFeature_Dx11::Init(ID3D11Device* InDevice, ID3D11DeviceContext* InContext, NVSDK_NGX_Parameter* InParameters)
 {
     LOG_FUNC();
 
     if (!_moduleLoaded)
     {
-        ImGui::InsertNotification(
-            { ImGuiToastType::Warning, 10000, "Couldn't load libxess_dx11.dll\nCheck if the dll is present" });
-        LOG_ERROR("libxess_dx11.dll not loaded!");
+        LOG_ERROR("libxess.dll not loaded!");
         return false;
     }
 
     if (IsInited())
         return true;
 
+    if (InDevice == nullptr)
+    {
+        LOG_ERROR("ID3D11Device is null!");
+        return false;
+    }
+
+    if (InContext == nullptr)
+    {
+        LOG_ERROR("ID3D11DeviceContext is null!");
+        return false;
+    }
+
+    Device = InDevice;
+    DeviceContext = InContext;
+
     {
 #ifndef DONT_USE_XMX
-        ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
+        ScopedSkipSpoofing skipSpoofing {};
 #endif // !DONT_USE_XMX
 
-        auto ret = XeSSProxy::D3D11CreateContext()(Device, &_xessContext);
+        auto ret = XeSSProxy::D3D11CreateContext()(InDevice, &_xessContext);
 
         if (ret != XESS_RESULT_SUCCESS)
         {
-            auto str = ResultToString(ret);
-            ImGui::InsertNotification(
-                { ImGuiToastType::Error, 10000, std::format("Couldn't create XeSS context\n{}", str).c_str() });
-            LOG_ERROR("xessD3D11CreateContext error: {0}", str);
+            LOG_ERROR("xessD3D12CreateContext error: {0}", ResultToString(ret));
             return false;
         }
 
@@ -231,12 +240,19 @@ bool XeSSFeature_Dx11::InitInternal(ID3D11DeviceContext* InContext, NVSDK_NGX_Pa
         }
     }
 
+    if (!Config::Instance()->OverlayMenu.value_or(true) && (Imgui == nullptr || Imgui.get() == nullptr))
+        Imgui = std::make_unique<Menu_Dx11>(GetForegroundWindow(), InDevice);
+
+    OutputScaler = std::make_unique<OS_Dx11>("Output Scaling", InDevice, (TargetWidth() < DisplayWidth()));
+    RCAS = std::make_unique<RCAS_Dx11>("RCAS", InDevice);
+
     SetInit(true);
 
     return true;
+    return true;
 }
 
-bool XeSSFeature_Dx11::EvaluateInternal(ID3D11DeviceContext* DeviceContext, NVSDK_NGX_Parameter* InParameters)
+bool XeSSFeature_Dx11::Evaluate(ID3D11DeviceContext* DeviceContext, NVSDK_NGX_Parameter* InParameters)
 {
     LOG_FUNC();
 
@@ -244,6 +260,45 @@ bool XeSSFeature_Dx11::EvaluateInternal(ID3D11DeviceContext* DeviceContext, NVSD
     {
         LOG_ERROR("Not inited!");
         return false;
+    }
+
+    if (!RCAS->IsInit())
+        Config::Instance()->RcasEnabled = false;
+
+    if (!OutputScaler->IsInit())
+        Config::Instance()->OutputScalingEnabled = false;
+
+    if (Config::Instance()->DADepthIsLinear.value_for_config_ignore_default() == std::nullopt)
+        Config::Instance()->DADepthIsLinear.set_volatile_value(false);
+
+    ID3D11ShaderResourceView* restoreSRVs[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
+    ID3D11SamplerState* restoreSamplerStates[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
+    ID3D11Buffer* restoreCBVs[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
+    ID3D11UnorderedAccessView* restoreUAVs[D3D11_1_UAV_SLOT_COUNT] = {};
+
+    // backup compute shader resources
+    for (UINT i = 0; i < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; i++)
+    {
+        restoreSRVs[i] = nullptr;
+        DeviceContext->CSGetShaderResources(i, 1, &restoreSRVs[i]);
+    }
+
+    for (UINT i = 0; i < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT; i++)
+    {
+        restoreSamplerStates[i] = nullptr;
+        DeviceContext->CSGetSamplers(i, 1, &restoreSamplerStates[i]);
+    }
+
+    for (UINT i = 0; i < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; i++)
+    {
+        restoreCBVs[i] = nullptr;
+        DeviceContext->CSGetConstantBuffers(i, 1, &restoreCBVs[i]);
+    }
+
+    for (UINT i = 0; i < D3D11_1_UAV_SLOT_COUNT; i++)
+    {
+        restoreUAVs[i] = nullptr;
+        DeviceContext->CSGetUnorderedAccessViews(i, 1, &restoreUAVs[i]);
     }
 
     if (State::Instance().xessDebug)
@@ -278,6 +333,13 @@ bool XeSSFeature_Dx11::EvaluateInternal(ID3D11DeviceContext* DeviceContext, NVSD
     InParameters->Get(NVSDK_NGX_Parameter_Reset, &params.resetHistory);
 
     GetRenderResolution(InParameters, &params.inputWidth, &params.inputHeight);
+
+    _sharpness = GetSharpness(InParameters);
+
+    float ssMulti = Config::Instance()->OutputScalingMultiplier.value_or(1.5f);
+
+    bool useSS =
+        Config::Instance()->OutputScalingEnabled.value_or_default() && (LowResMV() || RenderWidth() == DisplayWidth());
 
     LOG_DEBUG("Input Resolution: {0}x{1}", params.inputWidth, params.inputHeight);
 
@@ -318,7 +380,25 @@ bool XeSSFeature_Dx11::EvaluateInternal(ID3D11DeviceContext* DeviceContext, NVSD
     if (paramOutput)
     {
         LOG_DEBUG("Output exist..");
-        params.pOutputTexture = paramOutput;
+
+        if (useSS)
+        {
+            if (OutputScaler->CreateBufferResource(Device, paramOutput, TargetWidth(), TargetHeight()))
+                params.pOutputTexture = OutputScaler->Buffer();
+            else
+                params.pOutputTexture = paramOutput;
+        }
+        else
+            params.pOutputTexture = paramOutput;
+
+        if (Config::Instance()->RcasEnabled.value_or(true) &&
+            (_sharpness > 0.0f || (Config::Instance()->MotionSharpnessEnabled.value_or(false) &&
+                                   Config::Instance()->MotionSharpness.value_or(0.4) > 0.0f)) &&
+            RCAS != nullptr && RCAS.get() != nullptr && RCAS->IsInit() &&
+            RCAS->CreateBufferResource(Device, (ID3D11Texture2D*) params.pOutputTexture))
+        {
+            params.pOutputTexture = RCAS->Buffer();
+        }
     }
     else
     {
@@ -416,17 +496,6 @@ bool XeSSFeature_Dx11::EvaluateInternal(ID3D11DeviceContext* DeviceContext, NVSD
     else
         LOG_WARN("Can't get motion vector scales!");
 
-    float maxResponsiveMaskValue = 1.0f;
-
-    if (InParameters->Get("XeSS.MaxResponsiveMaskValue", &maxResponsiveMaskValue) == NVSDK_NGX_Result_Success &&
-        XeSSProxy::D3D11SetMaxResponsiveMaskValue() != nullptr)
-    {
-        xessResult = XeSSProxy::D3D11SetMaxResponsiveMaskValue()(_xessContext, maxResponsiveMaskValue);
-
-        if (xessResult != XESS_RESULT_SUCCESS)
-            LOG_ERROR("xessSetMaxResponsiveMaskValue: {0}", ResultToString(xessResult));
-    }
-
     InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_X, &params.inputColorBase.x);
     InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_Y, &params.inputColorBase.y);
     InParameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X, &params.inputDepthBase.x);
@@ -448,6 +517,99 @@ bool XeSSFeature_Dx11::EvaluateInternal(ID3D11DeviceContext* DeviceContext, NVSD
         LOG_ERROR("D3D11Execute error: {0}", ResultToString(xessResult));
         return false;
     }
+
+    // apply rcas
+    if (Config::Instance()->RcasEnabled.value_or(true) &&
+        (_sharpness > 0.0f || (Config::Instance()->MotionSharpnessEnabled.value_or(false) &&
+                               Config::Instance()->MotionSharpness.value_or(0.4) > 0.0f)) &&
+        RCAS != nullptr && RCAS.get() != nullptr && RCAS->CanRender())
+    {
+        RcasConstants rcasConstants {};
+
+        rcasConstants.Sharpness = _sharpness;
+        InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &rcasConstants.MvScaleX);
+        InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &rcasConstants.MvScaleY);
+        rcasConstants.CameraNear = Config::Instance()->FsrCameraNear.value_or_default();
+        rcasConstants.CameraFar = Config::Instance()->FsrCameraFar.value_or_default();
+
+        if (useSS)
+        {
+            if (!RCAS->Dispatch(Device, DeviceContext, (ID3D11Texture2D*) params.pOutputTexture,
+                                (ID3D11Texture2D*) params.pVelocityTexture, rcasConstants, OutputScaler->Buffer(),
+                                (ID3D11Texture2D*) params.pDepthTexture))
+            {
+                Config::Instance()->RcasEnabled = false;
+                return true;
+            }
+        }
+        else
+        {
+            if (!RCAS->Dispatch(Device, DeviceContext, (ID3D11Texture2D*) params.pOutputTexture,
+                                (ID3D11Texture2D*) params.pVelocityTexture, rcasConstants,
+                                (ID3D11Texture2D*) paramOutput, (ID3D11Texture2D*) params.pDepthTexture))
+            {
+                Config::Instance()->RcasEnabled = false;
+                return true;
+            }
+        }
+    }
+
+    if (useSS)
+    {
+        LOG_DEBUG("scaling output...");
+        if (!OutputScaler->Dispatch(Device, DeviceContext, OutputScaler->Buffer(), (ID3D11Texture2D*) paramOutput))
+        {
+            Config::Instance()->OutputScalingEnabled = false;
+            State::Instance().changeBackend[_handle->Id] = true;
+            return true;
+        }
+    }
+
+    // imgui
+    if (!Config::Instance()->OverlayMenu.value_or(true) && _frameCount > 30)
+    {
+        if (Imgui != nullptr && Imgui.get() != nullptr)
+        {
+            if (Imgui->IsHandleDifferent())
+            {
+                Imgui.reset();
+            }
+            else
+                Imgui->Render(DeviceContext, paramOutput);
+        }
+        else
+        {
+            if (Imgui == nullptr || Imgui.get() == nullptr)
+                Imgui = std::make_unique<Menu_Dx11>(GetForegroundWindow(), Device);
+        }
+    }
+
+    // restore compute shader resources
+    for (UINT i = 0; i < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; i++)
+    {
+        if (restoreSRVs[i] != nullptr)
+            DeviceContext->CSSetShaderResources(i, 1, &restoreSRVs[i]);
+    }
+
+    for (UINT i = 0; i < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT; i++)
+    {
+        if (restoreSamplerStates[i] != nullptr)
+            DeviceContext->CSSetSamplers(i, 1, &restoreSamplerStates[i]);
+    }
+
+    for (UINT i = 0; i < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; i++)
+    {
+        if (restoreCBVs[i] != nullptr)
+            DeviceContext->CSSetConstantBuffers(i, 1, &restoreCBVs[i]);
+    }
+
+    for (UINT i = 0; i < D3D11_1_UAV_SLOT_COUNT; i++)
+    {
+        if (restoreUAVs[i] != nullptr)
+            DeviceContext->CSSetUnorderedAccessViews(i, 1, &restoreUAVs[i], 0);
+    }
+
+    _frameCount++;
 
     return true;
 }

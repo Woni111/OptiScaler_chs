@@ -10,13 +10,9 @@
 #include "NVNGX_Parameter.h"
 #include "proxies/NVNGX_Proxy.h"
 
-#include <with_dx12/with_dx12.h>
-#include "FG/Upscaler_Inputs_Dx11wDx12.h"
-#include <hudfix/Hudfix_Dx11.h>
+#include <upscaler_time/UpscalerTime_Dx11.h>
 
 #include <ankerl/unordered_dense.h>
-#include <imgui/ImGuiNotify.hpp>
-#include <misc/IdentifyGpu.h>
 
 static ID3D11Device* D3D11Device = nullptr;
 static ankerl::unordered_dense::map<unsigned int, ContextData<IFeature_Dx11>> Dx11Contexts;
@@ -36,50 +32,8 @@ class ScopedInitDx11
         previousState = _skipInit;
         _skipInit = true;
     }
-
     ~ScopedInitDx11() { _skipInit = previousState; }
 };
-
-// Games can run more than one upscaler at the same time (e.g. a separate one for the minimap).
-// FG has to be fed by the one producing the actual game image, prefer the one matching the swapchain
-// and then the biggest output. Features that are no longer evaluated are ignored.
-static bool IsFGSourceFeature(unsigned int handleId)
-{
-    auto& state = State::Instance();
-    const auto& scDesc = state.currentSwapchainDesc.BufferDesc;
-
-    unsigned int bestHandle = 0;
-    bool bestMatchesSwapchain = false;
-    UINT64 bestArea = 0;
-
-    for (const auto& [id, context] : Dx11Contexts)
-    {
-        auto feature = context.feature.get();
-
-        if (feature == nullptr || !feature->IsInited())
-            continue;
-
-        if (id != handleId && context.lastEvalFrame + 2 < state.frameCount)
-            continue;
-
-        const bool matchesSwapchain =
-            feature->DisplayWidth() == scDesc.Width && feature->DisplayHeight() == scDesc.Height;
-        const auto area = (UINT64) feature->DisplayWidth() * feature->DisplayHeight();
-
-        const bool better =
-            bestHandle == 0 || (matchesSwapchain && !bestMatchesSwapchain) ||
-            (matchesSwapchain == bestMatchesSwapchain && (area > bestArea || (area == bestArea && id < bestHandle)));
-
-        if (better)
-        {
-            bestHandle = id;
-            bestMatchesSwapchain = matchesSwapchain;
-            bestArea = area;
-        }
-    }
-
-    return bestHandle == handleId;
-}
 
 static void UpdateInitPaths(NVSDK_NGX_FeatureCommonInfo* InFeatureInfo)
 {
@@ -227,21 +181,39 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_Init_Ext(unsigned long long InApp
     if (InFeatureInfo != nullptr && InSDKVersion > 0x0000013)
         State::Instance().NVNGX_Logger = InFeatureInfo->LoggingInfo;
 
-    if (State::Instance().nvngxDx11Inited && InDevice == D3D11Device)
+    if (State::Instance().NvngxDx11Inited)
     {
         LOG_WARN("NVNGX already inited");
         return NVSDK_NGX_Result_Success;
     }
 
     LOG_INFO("AppId: {0}", InApplicationId);
-    LOG_INFO("SDK: {0:x}", (unsigned int) InSDKVersion);
-    LOG_INFO(L"InApplicationDataPath {0}", std::wstring(InApplicationDataPath));
+    LOG_INFO("SDK: {0:x}", (int) InSDKVersion);
+    std::wstring string(InApplicationDataPath);
+
+    LOG_DEBUG("InApplicationDataPath {0}", wstring_to_string(string));
+
+    State::Instance().NVNGX_FeatureInfo_Paths.clear();
+
+    if (InFeatureInfo != nullptr)
+    {
+        for (size_t i = 0; i < InFeatureInfo->PathListInfo.Length; i++)
+        {
+            const wchar_t* path = InFeatureInfo->PathListInfo.Path[i];
+            std::wstring iniPathW(path);
+
+            State::Instance().NVNGX_FeatureInfo_Paths.push_back(iniPathW);
+            LOG_DEBUG("PathListInfo[{0}]: {1}", i, wstring_to_string(iniPathW));
+        }
+    }
 
     if (InDevice)
         D3D11Device = InDevice;
 
     State::Instance().currentD3D11Device = InDevice;
-    State::Instance().nvngxDx11Inited = true;
+    State::Instance().NvngxDx11Inited = true;
+
+    UpscalerTimeDx11::Init(InDevice);
 
     return NVSDK_NGX_Result_Success;
 }
@@ -389,9 +361,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_Shutdown()
     // HooksDx::UnHook();
 
     shutdown = false;
-    State::Instance().nvngxDx11Inited = false;
-
-    UpscalerInputsDx11wDx12::Shutdown();
+    State::Instance().NvngxDx11Inited = false;
 
     return NVSDK_NGX_Result_Success;
 }
@@ -414,12 +384,6 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_Shutdown1(ID3D11Device* InDevice)
 
 #pragma region NVSDK_NGX_D3D11 Parameters
 
-/**
- * @brief [Deprecated NGX API] Superceeded by NVSDK_NGX_AllocateParameters and NVSDK_NGX_GetCapabilityParameters.
- *
- * Retrieves a common NVSDK parameter map for providing params to the SDK. The lifetime of this
- * map is NOT managed by the application. It is expected to be managed internally by the SDK.
- */
 NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_GetParameters(NVSDK_NGX_Parameter** OutParameters)
 {
     LOG_FUNC();
@@ -438,27 +402,18 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_GetParameters(NVSDK_NGX_Parameter
 
         if (result == NVSDK_NGX_Result_Success)
         {
-            InitNGXParameters(*OutParameters, API::DX11);
-            SetNGXParamAllocType(*(*OutParameters), NGX_AllocTypes::NVPersistent);
+            InitNGXParameters(*OutParameters);
             return result;
         }
     }
 
-    // Get custom parameters if using custom backend
-    static NVNGX_Parameters oldParams = NVNGX_Parameters(API::DX11, true);
-    *OutParameters = &oldParams;
-    InitNGXParameters(*OutParameters, API::DX11);
+    *OutParameters = GetNGXParameters("OptiDx11");
 
     LOG_DEBUG("Returning custom Opti parameters");
 
     return NVSDK_NGX_Result_Success;
 }
 
-/**
- * @brief Allocates a new NVSDK parameter map pre-populated with NGX capabilities and information about available
- * features. The output parameter map may also be used in the same ways as a parameter map allocated with
- * AllocateParameters(). The lifetime of this map is managed by the calling application with DestroyParameters().
- */
 NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_GetCapabilityParameters(NVSDK_NGX_Parameter** OutParameters)
 {
     LOG_FUNC();
@@ -477,24 +432,18 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_GetCapabilityParameters(NVSDK_NGX
 
         if (result == NVSDK_NGX_Result_Success)
         {
-            InitNGXParameters(*OutParameters, API::DX11);
-            SetNGXParamAllocType(*(*OutParameters), NGX_AllocTypes::NVDynamic);
+            InitNGXParameters(*OutParameters);
             return result;
         }
     }
 
-    *OutParameters = new NVNGX_Parameters(API::DX11, false);
-    InitNGXParameters(*OutParameters, API::DX11);
+    *OutParameters = GetNGXParameters("OptiDx11");
 
     LOG_DEBUG("Returning custom Opti parameters");
 
     return NVSDK_NGX_Result_Success;
 }
 
-/**
- * @brief Allocates a new parameter map used to provide parameters needed by the DLSS API. The lifetime of this map
- * is managed by the calling application with DestroyParameters().
- */
 NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_AllocateParameters(NVSDK_NGX_Parameter** OutParameters)
 {
     LOG_FUNC();
@@ -509,13 +458,12 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_AllocateParameters(NVSDK_NGX_Para
         LOG_INFO("calling NVNGXProxy::D3D11_AllocateParameters result: {0:X}", (UINT) result);
 
         if (result == NVSDK_NGX_Result_Success)
-        {
-            SetNGXParamAllocType(*(*OutParameters), NGX_AllocTypes::NVDynamic);
             return result;
-        }
     }
 
-    *OutParameters = new NVNGX_Parameters(API::DX11, false);
+    auto params = new NVNGX_Parameters();
+    params->Name = "OptiDx11";
+    *OutParameters = params;
 
     return NVSDK_NGX_Result_Success;
 }
@@ -527,7 +475,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_PopulateParameters_Impl(NVSDK_NGX
     if (InParameters == nullptr)
         return NVSDK_NGX_Result_FAIL_InvalidParameter;
 
-    InitNGXParameters(InParameters, API::DX11);
+    InitNGXParameters(InParameters);
 
     return NVSDK_NGX_Result_Success;
 }
@@ -539,13 +487,19 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_DestroyParameters(NVSDK_NGX_Param
     if (InParameters == nullptr)
         return NVSDK_NGX_Result_Fail;
 
-    const bool isUsingDlss = Config::Instance()->DLSSEnabled.value_or_default() && NVNGXProxy::NVNGXModule();
-    const bool success = TryDestroyNGXParameters(InParameters, NVNGXProxy::D3D11_DestroyParameters());
+    if (Config::Instance()->DLSSEnabled.value_or_default() && NVNGXProxy::NVNGXModule() != nullptr &&
+        NVNGXProxy::D3D11_DestroyParameters() != nullptr)
+    {
+        LOG_INFO("calling NVNGXProxy::D3D11_DestroyParameters");
+        auto result = NVNGXProxy::D3D11_DestroyParameters()(InParameters);
+        LOG_INFO("calling NVNGXProxy::D3D11_DestroyParameters result: {0:X}", (UINT) result);
 
-    if (isUsingDlss)
-        UpscalerInputsDx11wDx12::Reset();
+        return result;
+    }
 
-    return success ? NVSDK_NGX_Result_Success : NVSDK_NGX_Result_Fail;
+    delete InParameters;
+
+    return NVSDK_NGX_Result_Success;
 }
 
 NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_GetScratchBufferSize(NVSDK_NGX_Feature InFeatureId,
@@ -589,22 +543,22 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext
 
     if (InFeatureID == NVSDK_NGX_Feature_SuperSampling)
     {
-        Upscaler upscalerChoice = Upscaler::FSR22; // Default FSR 2.2.1
+        std::string upscalerChoice = "fsr22"; // Default FSR 2.2.1
 
         // If original NVNGX available use DLSS as base upscaler
-        if (IdentifyGpu::getPrimaryGpu().dlssCapable && NVNGXProxy::IsDx11Inited())
-            upscalerChoice = Upscaler::DLSS;
+        if (Config::Instance()->DLSSEnabled.value_or_default() && NVNGXProxy::IsDx11Inited())
+            upscalerChoice = "dlss";
 
         if (Config::Instance()->Dx11Upscaler.has_value())
             upscalerChoice = Config::Instance()->Dx11Upscaler.value();
 
-        LOG_INFO("Creating new {} feature", UpscalerDisplayName(upscalerChoice));
+        LOG_INFO("Creating new {} feature", upscalerChoice);
 
         Dx11Contexts[handleId] = {};
 
         if (!FeatureProvider_Dx11::GetFeature(upscalerChoice, handleId, InParameters, &Dx11Contexts[handleId].feature))
         {
-            LOG_ERROR("Can't create {} feature", UpscalerDisplayName(upscalerChoice));
+            LOG_ERROR("Can't create {} feature", upscalerChoice);
             return NVSDK_NGX_Result_Fail;
         }
     }
@@ -614,7 +568,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext
 
         Dx11Contexts[handleId] = {};
 
-        if (!FeatureProvider_Dx11::GetFeature(Upscaler::DLSSD, handleId, InParameters, &Dx11Contexts[handleId].feature))
+        if (!FeatureProvider_Dx11::GetFeature("dlssd", handleId, InParameters, &Dx11Contexts[handleId].feature))
         {
             LOG_ERROR("Can't create DLSSD feature");
             return NVSDK_NGX_Result_Fail;
@@ -638,18 +592,17 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext
 
     D3D11Device->Release();
 
-    State::Instance().autoExposure.reset();
+    State::Instance().AutoExposure.reset();
 
     if (deviceContext->ModuleLoaded() && deviceContext->Init(D3D11Device, InDevCtx, InParameters))
     {
         State::Instance().currentFeature = deviceContext;
-        UpscalerInputsDx11wDx12::Reset();
         return NVSDK_NGX_Result_Success;
     }
 
     LOG_ERROR("CreateFeature failed");
 
-    State::Instance().newBackend = Upscaler::FSR22;
+    State::Instance().newBackend = "fsr22";
     State::Instance().changeBackend[handleId] = true;
 
     return NVSDK_NGX_Result_Success;
@@ -676,15 +629,6 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_ReleaseFeature(NVSDK_NGX_Handle* 
         {
             return NVSDK_NGX_Result_FAIL_FeatureNotFound;
         }
-    }
-
-    if (State::Instance().currentFG != nullptr && State::Instance().activeFgInput == FGInput::Upscaler &&
-        IsFGSourceFeature(handleId))
-    {
-        State::Instance().fgChanged = true;
-        State::Instance().currentFG->DestroyFGContext();
-        State::Instance().clearCapturedHudlesses = true;
-        UpscalerInputsDx11wDx12::Reset();
     }
 
     if (!shutdown)
@@ -772,7 +716,6 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceConte
         return NVSDK_NGX_Result_Fail;
     }
 
-    State& state = State::Instance();
     auto handleId = InFeatureHandle->Id;
     if (handleId < DLSS_MOD_ID_OFFSET)
     {
@@ -799,41 +742,38 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceConte
     IFeature_Dx11* deviceContext = nullptr;
     auto activeContext = &Dx11Contexts[handleId];
 
-    if (state.changeBackend[handleId])
+    if (State::Instance().changeBackend[handleId])
     {
-        UpscalerInputsDx11wDx12::Reset();
-
-        auto successfulPhase = FeatureProvider_Dx11::ChangeFeature(state.newBackend, D3D11Device, InDevCtx, handleId,
-                                                                   InParameters, activeContext);
+        FeatureProvider_Dx11::ChangeFeature(State::Instance().newBackend, D3D11Device, InDevCtx, handleId, InParameters,
+                                            activeContext);
 
         evalCounter = 0;
 
-        if (activeContext->changeBackendCounter != 0 || !successfulPhase)
-        {
-            return NVSDK_NGX_Result_Success;
-        }
+        return NVSDK_NGX_Result_Success;
     }
 
     if (activeContext->feature == nullptr) // prevent source api name flicker when dlssg is active
     {
-        state.setInputApiName = state.currentInputApiName;
+        State::Instance().setInputApiName = State::Instance().currentInputApiName;
     }
     else
     {
         deviceContext = activeContext->feature.get();
-
-        // FG reads render size etc. from currentFeature, so it has to stay on the game image upscaler
-        if (state.currentFeature == nullptr || IsFGSourceFeature(handleId))
-            state.currentFeature = deviceContext;
+        State::Instance().currentFeature = deviceContext;
     }
 
-    const auto targetApiName =
-        !state.setInputApiName.has_value() ? ApiUpscalerInput::DLSS_DX11 : state.setInputApiName.value();
+    if (State::Instance().setInputApiName.length() == 0)
+    {
+        if (std::strcmp(State::Instance().currentInputApiName.c_str(), "DLSS") != 0)
+            State::Instance().currentInputApiName = "DLSS";
+    }
+    else
+    {
+        if (std::strcmp(State::Instance().currentInputApiName.c_str(), State::Instance().setInputApiName.c_str()) != 0)
+            State::Instance().currentInputApiName = State::Instance().setInputApiName;
+    }
 
-    if (state.currentInputApiName != targetApiName)
-        state.currentInputApiName = targetApiName;
-
-    state.setInputApiName.reset();
+    State::Instance().setInputApiName.clear();
 
     if (deviceContext == nullptr)
     {
@@ -841,41 +781,16 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceConte
         return NVSDK_NGX_Result_Success;
     }
 
-    const bool suppressDx11HudfixTracking = state.activeFgInput == FGInput::Upscaler &&
-                                            Config::Instance()->FGHUDFix.value_or_default() &&
-                                            state.swapchainInteropApi == SwapchainInteropApi::Dx11wDx12;
-    if (suppressDx11HudfixTracking)
-        Hudfix_Dx11::SetSkipStatus(true);
+    UpscalerTimeDx11::UpscaleStart(InDevCtx);
 
-    auto upscaleResult = deviceContext->Evaluate(InDevCtx, InParameters);
-    activeContext->lastEvalFrame = state.frameCount;
-
-    if (State::Instance().activeFgInput == FGInput::Upscaler && IsFGSourceFeature(handleId))
+    if (!deviceContext->Evaluate(InDevCtx, InParameters) && !deviceContext->IsInited() &&
+        (deviceContext->Name() == "XeSS" || deviceContext->Name() == "DLSS" || deviceContext->Name() == "FSR3 w/Dx12"))
     {
-        if (WithDx12::IsInited())
-        {
-            auto cq = WithDx12::GetD3D12CommandQueue();
-            auto device = WithDx12::GetD3D12Device();
-
-            UpscalerInputsDx11wDx12::Init(D3D11Device, InDevCtx, device, cq);
-
-            UpscalerInputsDx11wDx12::UpscaleStart(InParameters, deviceContext);
-            UpscalerInputsDx11wDx12::UpscaleEnd(InParameters, deviceContext);
-        }
+        State::Instance().newBackend = "fsr22";
+        State::Instance().changeBackend[handleId] = true;
     }
 
-    if (suppressDx11HudfixTracking)
-        Hudfix_Dx11::SetSkipStatus(false);
-
-    auto upscaler = deviceContext->GetUpscalerType();
-    if (!upscaleResult && !deviceContext->IsInited() &&
-        (upscaler == Upscaler::XeSS || upscaler == Upscaler::XeSS_on12 || upscaler == Upscaler::DLSS ||
-         upscaler == Upscaler::DLSS_on12 || upscaler == Upscaler::FFX_on12))
-    {
-        ImGui::InsertNotification({ ImGuiToastType::Error, 10000, "Upscaler failed to run!" });
-        state.newBackend = Upscaler::FSR22;
-        state.changeBackend[handleId] = true;
-    }
+    UpscalerTimeDx11::UpscaleEnd(InDevCtx);
 
     return NVSDK_NGX_Result_Success;
 }

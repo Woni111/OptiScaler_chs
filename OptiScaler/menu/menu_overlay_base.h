@@ -22,5 +22,4 @@ class MenuOverlayBase
     static void Shutdown();
     static void HideMenu();
     static void Present();
-    static void ApplyThemeStyle();
 };

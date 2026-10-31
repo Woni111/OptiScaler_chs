@@ -4,6 +4,8 @@
 class LibraryLoadHooks
 {
   private:
+    inline static std::unordered_map<std::wstring, bool> _overlayMethodsCalled;
+
     static void CheckModulesInMemory();
     static bool StartsWithInsensitive(std::wstring_view str, std::wstring_view prefix);
 
@@ -11,10 +13,6 @@ class LibraryLoadHooks
     static HMODULE LoadLibraryCheckA(std::string libName, LPCSTR lpLibFullPath);
     static HMODULE LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibFullPath);
     static std::optional<NTSTATUS> FreeLibrary(PVOID library);
-
-    // Call after the original FreeLibrary / LdrUnloadDll returned
-    static void AfterFreeLibrary(PVOID library);
-    static void AfterLoadLibrary(HMODULE library);
 
     static HMODULE LoadNvApi();
     // static HMODULE LoadFfxapiVk(std::wstring originalPath);

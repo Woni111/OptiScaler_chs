@@ -77,8 +77,6 @@ static bool CreateDLSSContext(FfxFsr2Context* handle, const FfxFsr2DispatchDescr
     if ((initParams->flags & FFX_FSR2_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS) == 0)
         initFlags |= NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
 
-    State::Instance().dynamicResolution = (initParams->flags & FFX_FSR2_ENABLE_DYNAMIC_RESOLUTION) != 0;
-
     params->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, initFlags);
 
     params->Set(NVSDK_NGX_Parameter_Width, pExecParams->renderSize.width);
@@ -216,7 +214,7 @@ static FfxErrorCode ffxFsr2ContextCreate_Dx11(FfxFsr2Context* context, FfxFsr2Co
         return ccResult;
     }
 
-    if (!state.nvngxDx11Inited)
+    if (!state.NvngxDx11Inited)
     {
         NVSDK_NGX_FeatureCommonInfo fcInfo {};
         auto exePath = Util::ExePath().remove_filename();
@@ -304,7 +302,7 @@ static FfxErrorCode ffxFsr2ContextDispatch_Dx11(FfxFsr2Context* context,
     LOG_DEBUG("handle: {:X}, internalResolution: {}x{}", handle->Id, dispatchDescription->renderSize.width,
               dispatchDescription->renderSize.height);
 
-    State::Instance().setInputApiName = ApiUpscalerInput::FSR2X_DX11;
+    State::Instance().setInputApiName = "FSR2.X";
 
     auto evalResult = NVSDK_NGX_D3D11_EvaluateFeature((ID3D11DeviceContext*) dispatchDescription->commandList, handle,
                                                       params, nullptr);

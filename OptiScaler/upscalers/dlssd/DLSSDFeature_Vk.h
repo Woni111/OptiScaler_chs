@@ -8,19 +8,14 @@ class DLSSDFeatureVk : public DLSSDFeature, public IFeature_Vk
 {
   private:
   protected:
-    // From IFeature_Vk
-    bool InitInternal(VkCommandBuffer InCmdList, NVSDK_NGX_Parameter* InParameters) override;
-    bool EvaluateInternal(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InParameters) override;
-
   public:
+    bool Init(VkInstance InInstance, VkPhysicalDevice InPD, VkDevice InDevice, VkCommandBuffer InCmdList,
+              PFN_vkGetInstanceProcAddr InGIPA, PFN_vkGetDeviceProcAddr InGDPA,
+              NVSDK_NGX_Parameter* InParameters) override;
+    bool Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InParameters) override;
+
     feature_version Version() override { return DLSSDFeature::Version(); }
-    Upscaler GetUpscalerType() const final { return DLSSDFeature::GetUpscalerType(); }
-    API Api() const override { return IFeature_Vk::Api(); }
-    std::optional<double> ReadUpscalerTime(void* unused) override { return IFeature_Vk::ReadUpscalerTime(unused); };
-    void ReadDetailedGpuTimes(void* unused, std::vector<DetailedGpuTime>& detailedGpuTimes) override
-    {
-        return IFeature_Vk::ReadDetailedGpuTimes(unused, detailedGpuTimes);
-    };
+    std::string Name() const override { return DLSSDFeature::Name(); }
 
     bool IsWithDx12() override { return false; }
 

@@ -8,29 +8,30 @@ void Sl_Inputs_Dx12::CheckForFrame(IFGFeature_Dx12* fg, uint32_t frameId)
 {
     std::scoped_lock lock(_frameBoundaryMutex);
 
-    const bool presentMarked = _isFrameFinished && _lastPresentFrameId == _currentFrameId;
-    const bool fgDispatched =
-        fg->IsActive() && !fg->IsPaused() && fg->IsDispatched() && fg->FrameCount() == _currentFrameId;
-
-    if ((presentMarked || fgDispatched) && frameId == 0 && _currentFrameId != 0)
+    if (_isFrameFinished && _lastFrameId == _currentFrameId && frameId == 0 && frameId != _currentFrameId)
     {
-        LOG_DEBUG("1> CheckForFrame: frameId={}, currentFrameId={}, lastPresentFrameId={}, isFrameFinished={}", frameId,
-                  _currentFrameId, _lastPresentFrameId, _isFrameFinished);
+        LOG_DEBUG("1> CheckForFrame: frameId={}, currentFrameId={}, lastFrameId={}, isFrameFinished={}", frameId,
+                  _currentFrameId, _lastFrameId, _isFrameFinished);
 
         _isFrameFinished = false;
 
         fg->StartNewFrame();
         _currentIndex = fg->GetIndex();
-        _currentFrameId++;
+
+        if (frameId != 0)
+            _currentFrameId = frameId;
+        else
+            _currentFrameId = _lastFrameId + 1;
+
         _frameIdIndex[_currentIndex] = _currentFrameId;
     }
     else if (frameId != 0 && frameId > _currentFrameId)
     {
-        LOG_DEBUG("2> CheckForFrame: frameId={}, currentFrameId={}, lastPresentFrameId={}, isFrameFinished={}", frameId,
-                  _currentFrameId, _lastPresentFrameId, _isFrameFinished);
+        LOG_DEBUG("2> CheckForFrame: frameId={}, currentFrameId={}, lastFrameId={}, isFrameFinished={}", frameId,
+                  _currentFrameId, _lastFrameId, _isFrameFinished);
 
         _isFrameFinished = false;
-        //_lastPresentFrameId = frameId - 1;
+        _lastFrameId = frameId - 1;
 
         fg->StartNewFrame();
         _currentIndex = fg->GetIndex();
@@ -52,7 +53,7 @@ int Sl_Inputs_Dx12::IndexForFrameId(uint32_t frameId) const
 
 bool Sl_Inputs_Dx12::setConstants(const sl::Constants& values, uint32_t frameId)
 {
-    auto fgOutput = State::Instance().currentFG;
+    auto fgOutput = reinterpret_cast<IFGFeature_Dx12*>(State::Instance().currentFG);
 
     if (fgOutput == nullptr)
         return false;
@@ -126,7 +127,7 @@ bool Sl_Inputs_Dx12::setConstants(const sl::Constants& values, uint32_t frameId)
 
         fgOutput->EvaluateState(State::Instance().currentD3D12Device, fgConstants);
 
-        if (!config->IsFGEnabled())
+        if (!config->FGEnabled.value_or_default())
         {
             LOG_TRACE("FG not enabled");
             return true;
@@ -248,9 +249,9 @@ bool Sl_Inputs_Dx12::setConstants(const sl::Constants& values, uint32_t frameId)
     return dataFound;
 }
 
-bool Sl_Inputs_Dx12::evaluateState()
+bool Sl_Inputs_Dx12::evaluateState(ID3D12Device* device)
 {
-    auto fgOutput = State::Instance().currentFG;
+    auto fgOutput = reinterpret_cast<IFGFeature_Dx12*>(State::Instance().currentFG);
 
     if (fgOutput == nullptr)
         return false;
@@ -272,7 +273,7 @@ bool Sl_Inputs_Dx12::evaluateState()
     if (repeatsInRow > 10 && fgOutput->IsActive())
     {
         LOG_WARN("Many frame count repeats in a row, stopping FG");
-        State::Instance().fgChanged = true;
+        State::Instance().FGchanged = true;
         repeatsInRow = 0;
         return false;
     }
@@ -283,12 +284,12 @@ bool Sl_Inputs_Dx12::evaluateState()
 bool Sl_Inputs_Dx12::reportResource(const sl::ResourceTag& tag, ID3D12GraphicsCommandList* cmdBuffer, uint32_t frameId)
 {
     auto& state = State::Instance();
-    state.dlssgLastFrame = state.fgLastFrame;
+    state.DLSSGLastFrame = state.FGLastFrame;
 
     auto fgOutput = reinterpret_cast<IFGFeature_Dx12*>(state.currentFG);
 
     // It's possible for only some resources to be marked ready if FGEnabled is enabled during resource tagging
-    if (fgOutput == nullptr || !Config::Instance()->IsFGEnabled())
+    if (fgOutput == nullptr || !Config::Instance()->FGEnabled.value_or_default())
         return false;
 
     static const bool ignoreValidUntilEvaluateForFG =
@@ -449,7 +450,7 @@ void Sl_Inputs_Dx12::markPresent(uint64_t frameId)
     std::scoped_lock lock(_frameBoundaryMutex);
     LOG_TRACE("frameId: {}", frameId);
     _isFrameFinished = true;
-    _lastPresentFrameId = static_cast<uint32_t>(frameId);
+    _lastFrameId = static_cast<uint32_t>(frameId);
 
     if (State::Instance().currentFG != nullptr)
         State::Instance().currentFG->SetFrameCount(frameId);

@@ -3,9 +3,6 @@
 #include <State.h>
 #include <Config.h>
 
-#include <hudfix/Hudfix_Dx12.h>
-#include <misc/DeferredRelease.h>
-
 #include <magic_enum.hpp>
 
 bool IFGFeature_Dx12::GetResourceCopy(FG_ResourceType type, D3D12_RESOURCE_STATES bufferState, ID3D12Resource* output)
@@ -15,7 +12,7 @@ bool IFGFeature_Dx12::GetResourceCopy(FG_ResourceType type, D3D12_RESOURCE_STATE
 
     auto resource = GetResource(type);
 
-    if (!resource || (resource->copy == nullptr && resource->validity == FG_ResourceValidity::ValidNow))
+    if (resource == nullptr || (resource->copy == nullptr && resource->validity == FG_ResourceValidity::ValidNow))
     {
         LOG_WARN("No resource copy of type {} to use", magic_enum::enum_name(type));
         return false;
@@ -49,77 +46,9 @@ bool IFGFeature_Dx12::HasResource(FG_ResourceType type, int index)
     return _frameResources[index].contains(type);
 }
 
-bool IFGFeature_Dx12::WaitForUIAllocator(UINT index)
-{
-    if (_uiFence == nullptr || _uiFenceEvent == nullptr)
-        return true;
-
-    const auto fenceValue = _uiAllocatorFenceValues[index];
-    if (fenceValue == 0)
-        return true;
-
-    const auto completedValue = _uiFence->GetCompletedValue();
-    if (completedValue >= fenceValue)
-        return true;
-
-    auto result = _uiFence->SetEventOnCompletion(fenceValue, _uiFenceEvent);
-    if (FAILED(result))
-    {
-        LOG_ERROR("UI allocator fence SetEventOnCompletion failed. slot {}, fence {}, completed {}, result {:X}", index,
-                  fenceValue, completedValue, (UINT) result);
-        return false;
-    }
-
-    const auto waitResult = WaitForSingleObject(_uiFenceEvent, 5000);
-    if (waitResult != WAIT_OBJECT_0)
-    {
-        LOG_ERROR("UI allocator fence wait failed. slot {}, fence {}, completed {}, waitResult {:X}", index, fenceValue,
-                  _uiFence->GetCompletedValue(), waitResult);
-        return false;
-    }
-
-    return true;
-}
-
-bool IFGFeature_Dx12::SubmitUICommandList(UINT index)
-{
-    if (index >= BUFFER_COUNT || !_uiCommandListResetted[index])
-        return true;
-
-    if (_gameCommandQueue == nullptr || _uiFence == nullptr)
-    {
-        LOG_ERROR("Can't submit UI command list. slot {}, queue {:X}, fence {:X}", index, (size_t) _gameCommandQueue,
-                  (size_t) _uiFence);
-        return false;
-    }
-
-    LOG_DEBUG("Executing _uiCommandList[{}]: {:X}, fence {}", index, (size_t) _uiCommandList[index],
-              _uiAllocatorFenceValues[index]);
-
-    auto closeResult = _uiCommandList[index]->Close();
-    if (FAILED(closeResult))
-    {
-        LOG_ERROR("_uiCommandList[{}]->Close() error: {:X}", index, (UINT) closeResult);
-        return false;
-    }
-
-    _gameCommandQueue->ExecuteCommandLists(1, (ID3D12CommandList**) &_uiCommandList[index]);
-    _uiCommandListResetted[index] = false;
-
-    auto signalResult = _gameCommandQueue->Signal(_uiFence, _uiAllocatorFenceValues[index]);
-    if (FAILED(signalResult))
-    {
-        LOG_ERROR("UI allocator fence signal failed. slot {}, fence {}, result {:X}", index,
-                  _uiAllocatorFenceValues[index], (UINT) signalResult);
-        return false;
-    }
-
-    return true;
-}
-
 ID3D12GraphicsCommandList* IFGFeature_Dx12::GetUICommandList(int index)
 {
-    if (index < 0 || index >= BUFFER_COUNT)
+    if (index < 0)
         index = GetIndex();
 
     LOG_DEBUG("index: {}", index);
@@ -140,16 +69,18 @@ ID3D12GraphicsCommandList* IFGFeature_Dx12::GetUICommandList(int index)
 
         if (i != index && _uiCommandListResetted[i])
         {
-            if (!SubmitUICommandList((UINT) i))
-                return nullptr;
+            LOG_DEBUG("Executing _uiCommandList[{}]: {:X}", i, (size_t) _uiCommandList[i]);
+            auto closeResult = _uiCommandList[i]->Close();
+
+            if (closeResult != S_OK)
+                LOG_ERROR("_uiCommandList[{}]->Close() error: {:X}", i, (UINT) closeResult);
+
+            _uiCommandListResetted[i] = false;
         }
     }
 
     if (!_uiCommandListResetted[index])
     {
-        if (!WaitForUIAllocator((UINT) index))
-            return nullptr;
-
         auto result = _uiCommandAllocator[index]->Reset();
 
         if (result == S_OK)
@@ -157,20 +88,13 @@ ID3D12GraphicsCommandList* IFGFeature_Dx12::GetUICommandList(int index)
             result = _uiCommandList[index]->Reset(_uiCommandAllocator[index], nullptr);
 
             if (result == S_OK)
-            {
                 _uiCommandListResetted[index] = true;
-                _uiAllocatorFenceValues[index] = ++_uiFenceValue;
-            }
             else
-            {
                 LOG_ERROR("_uiCommandList[{}]->Reset() error: {:X}", index, (UINT) result);
-                return nullptr;
-            }
         }
         else
         {
             LOG_ERROR("_uiCommandAllocator[{}]->Reset() error: {:X}", index, (UINT) result);
-            return nullptr;
         }
     }
 
@@ -232,20 +156,21 @@ ID3D12GraphicsCommandList* IFGFeature_Dx12::GetSCCommandList(int index)
     return _scCommandList[index];
 }
 
-LockedDx12Resource IFGFeature_Dx12::GetResource(FG_ResourceType type, int index)
+Dx12Resource* IFGFeature_Dx12::GetResource(FG_ResourceType type, int index)
 {
     if (index < 0)
         index = GetIndex();
 
-    std::shared_lock lock(_resourceMutex[index]);
+    std::shared_lock<std::shared_mutex> lock(_resourceMutex[index]);
 
-    auto& resources = _frameResources[index];
+    if (!_frameResources[index].contains(type))
+        return nullptr;
 
-    auto it = resources.find(type);
-    if (it != resources.end())
-        return { &it->second, std::move(lock) };
+    auto& currentIndex = _frameResources[index];
+    if (auto it = currentIndex.find(type); it != currentIndex.end())
+        return &it->second;
 
-    return { nullptr, std::move(lock) };
+    return nullptr;
 }
 
 void IFGFeature_Dx12::NewFrame()
@@ -260,45 +185,13 @@ void IFGFeature_Dx12::NewFrame()
 
     auto fIndex = GetIndex();
 
-    // Submit fence value before the slot can be reused
-    if (_uiCommandListResetted[fIndex] && !SubmitUICommandList((UINT) fIndex))
-        LOG_ERROR("Failed to submit pending UI command list for recycled slot {}", fIndex);
-
     std::unique_lock<std::shared_mutex> lock(_resourceMutex[fIndex]);
 
     LOG_DEBUG("_frameCount: {}, fIndex: {}", _frameCount, fIndex);
 
     _frameResources[fIndex].clear();
+    _uiCommandListResetted[fIndex] = false;
     _lastFGFramePresentId = _fgFramePresentId;
-}
-
-void IFGFeature_Dx12::ReleaseResourceCopies()
-{
-    for (size_t i = 0; i < BUFFER_COUNT; i++)
-    {
-        std::unique_lock<std::shared_mutex> lock(_resourceMutex[i]);
-
-        bool released = false;
-
-        // Entries are kept, callbacks without the lock index the map
-        for (auto& [type, copy] : _resourceCopy[i])
-        {
-            if (copy == nullptr)
-                continue;
-
-            DeferredRelease::Release(copy);
-            released = true;
-        }
-
-        // Frame resources can point at the released copies
-        if (released)
-            _frameResources[i].clear();
-    }
-
-    _mvFlip.reset();
-    _depthFlip.reset();
-
-    Hudfix_Dx12::ReleaseBuffers();
 }
 
 void IFGFeature_Dx12::FlipResource(Dx12Resource* resource)
@@ -347,19 +240,12 @@ void IFGFeature_Dx12::FlipResource(Dx12Resource* resource)
     if (flip->get()->IsInit())
     {
         auto cmdList = (resource->cmdList != nullptr) ? resource->cmdList : GetUICommandList(fIndex);
-        if (cmdList == nullptr)
-        {
-            LOG_ERROR("Can't flip {}: GetUICommandList({}) failed", magic_enum::enum_name(type), fIndex);
-            return;
-        }
-
-        auto result = flip->get()->Dispatch((ID3D12GraphicsCommandList*) cmdList, resource->resource, flipOutput,
-                                            resource->width, resource->height, true);
+        auto result = flip->get()->Dispatch(_device, (ID3D12GraphicsCommandList*) cmdList, resource->resource,
+                                            flipOutput, resource->width, resource->height, true);
 
         if (result)
         {
             LOG_TRACE("Setting {} from flip, index: {}", magic_enum::enum_name(type), fIndex);
-            resource->validity = FG_ResourceValidity::UntilPresent;
             resource->copy = flipOutput;
             resource->state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         }
@@ -388,8 +274,8 @@ bool IFGFeature_Dx12::CreateBufferResourceWithSize(ID3D12Device* device, ID3D12R
         if (bufDesc.Width != width || bufDesc.Height != height || bufDesc.Format != inDesc.Format ||
             bufDesc.Flags != inDesc.Flags)
         {
-            // Previous frames can still be using it
-            DeferredRelease::Release(*target);
+            (*target)->Release();
+            (*target) = nullptr;
         }
         else
         {
@@ -478,8 +364,17 @@ void IFGFeature_Dx12::DestroyCopyCmdList()
 {
     for (size_t i = 0; i < BUFFER_COUNT; i++)
     {
-        SAFE_RELEASE(_copyCommandAllocator[i]);
-        SAFE_RELEASE(_copyCommandList[i]);
+        if (_copyCommandAllocator[i] != nullptr)
+        {
+            _copyCommandAllocator[i]->Release();
+            _copyCommandAllocator[i] = nullptr;
+        }
+
+        if (_copyCommandList[i] != nullptr)
+        {
+            _copyCommandList[i]->Release();
+            _copyCommandList[i] = nullptr;
+        }
     }
 }
 
@@ -500,13 +395,16 @@ bool IFGFeature_Dx12::CreateBufferResource(ID3D12Device* device, ID3D12Resource*
 
     if (*target != nullptr)
     {
+        //(*target)->Release();
+        //(*target) = nullptr;
+
         auto bufDesc = (*target)->GetDesc();
 
         if (bufDesc.Width != inDesc.Width || bufDesc.Height != inDesc.Height || bufDesc.Format != inDesc.Format ||
             bufDesc.Flags != inDesc.Flags)
         {
-            // Previous frames can still be using it
-            DeferredRelease::Release(*target);
+            (*target)->Release();
+            (*target) = nullptr;
         }
         else
         {
@@ -562,68 +460,4 @@ bool IFGFeature_Dx12::CopyResource(ID3D12GraphicsCommandList* cmdList, ID3D12Res
     ResourceBarrier(cmdList, source, D3D12_RESOURCE_STATE_COPY_SOURCE, sourceState);
 
     return result;
-}
-
-bool IFGFeature_Dx12::CreateSwapchain(IDXGIFactory* factory, ID3D12CommandQueue* cmdQueue, DXGI_SWAP_CHAIN_DESC* desc,
-                                      IDXGISwapChain** swapChain, bool readyToRelease)
-{
-    if (State::Instance().currentFGSwapchain != nullptr && _hwnd == desc->OutputWindow)
-    {
-        if (Config::Instance()->FGPreserveSwapChain.value_or_default())
-        {
-            LOG_WARN("FG swapchain already created for the same output window!");
-            auto result = State::Instance().currentFGSwapchain->ResizeBuffers(
-                              desc->BufferCount, desc->BufferDesc.Width, desc->BufferDesc.Height,
-                              desc->BufferDesc.Format, desc->Flags) == S_OK;
-
-            *swapChain = State::Instance().currentFGSwapchain;
-            return result;
-        }
-        // Game is creating new swapchain without releasing old one,
-        // we need to release it to avoid errors
-        else if (readyToRelease)
-        {
-            LOG_INFO("Releasing old swapchain");
-            ReleaseSwapchain(_hwnd);
-        }
-        else
-        {
-            LOG_WARN("FG swapchain already exists for the same output window and is not ready to release!");
-            return false;
-        }
-    }
-
-    return CreateSwapchainInternal(factory, cmdQueue, desc, swapChain);
-}
-
-bool IFGFeature_Dx12::CreateSwapchain1(IDXGIFactory* factory, ID3D12CommandQueue* cmdQueue, HWND hwnd,
-                                       DXGI_SWAP_CHAIN_DESC1* desc, DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc,
-                                       IDXGISwapChain1** swapChain, bool readyToRelease)
-{
-    if (State::Instance().currentFGSwapchain != nullptr && _hwnd == hwnd)
-    {
-        if (Config::Instance()->FGPreserveSwapChain.value_or_default())
-        {
-            LOG_WARN("FG swapchain already created for the same output window!");
-            auto result = State::Instance().currentFGSwapchain->ResizeBuffers(
-                              desc->BufferCount, desc->Width, desc->Height, desc->Format, desc->Flags) == S_OK;
-
-            *swapChain = (IDXGISwapChain1*) State::Instance().currentFGSwapchain;
-            return result;
-        }
-        // Game is creating new swapchain without releasing old one,
-        // we need to release it to avoid errors
-        else if (readyToRelease)
-        {
-            LOG_INFO("Releasing old swapchain");
-            ReleaseSwapchain(_hwnd);
-        }
-        else
-        {
-            LOG_WARN("FG swapchain already exists for the same output window and is not ready to release!");
-            return false;
-        }
-    }
-
-    return CreateSwapchain1Internal(factory, cmdQueue, hwnd, desc, pFullscreenDesc, swapChain);
 }

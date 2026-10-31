@@ -1,12 +1,10 @@
 #include "pch.h"
 #include "Upscaler_Inputs_Dx12.h"
-#include "Upscaler_Inputs.h"
 #include <hudfix/Hudfix_Dx12.h>
 #include <resource_tracking/ResTrack_dx12.h>
-#include "shaders/depth_scale/DS_Dx12.h"
-#include "MathUtils.h"
 
-using namespace OptiMath;
+#include "shaders/depth_scale/DS_Dx12.h"
+
 static DS_Dx12* DepthScale = nullptr;
 
 void UpscalerInputsDx12::Init(ID3D12Device* device)
@@ -32,30 +30,84 @@ void UpscalerInputsDx12::UpscaleStart(ID3D12GraphicsCommandList* InCmdList, NVSD
 {
     Hudfix_Dx12::SetSkipStatus(true);
 
+    // FSR Camera values
+    float cameraNear = 0.0f;
+    float cameraFar = 0.0f;
+    float cameraVFov = 0.0f;
+    float meterFactor = 0.0f;
     float mvScaleX = 0.0f;
     float mvScaleY = 0.0f;
     float jitterX = 0.0f;
     float jitterY = 0.0f;
 
-    // FSR Camera values
-    auto camera = UpscalerInputs::GetCameraValues(*InParameters, feature);
+    float tempCameraNear = 0.0f;
+    float tempCameraFar = 0.0f;
+    InParameters->Get("FSR.cameraNear", &tempCameraNear);
+    InParameters->Get("FSR.cameraFar", &tempCameraFar);
+
+    if (!Config::Instance()->FsrUseFsrInputValues.value_or_default() ||
+        (tempCameraNear == 0.0f && tempCameraFar == 0.0f))
+    {
+        if (feature->DepthInverted())
+        {
+            cameraFar = Config::Instance()->FsrCameraNear.value_or_default();
+            cameraNear = Config::Instance()->FsrCameraFar.value_or_default();
+        }
+        else
+        {
+            cameraFar = Config::Instance()->FsrCameraFar.value_or_default();
+            cameraNear = Config::Instance()->FsrCameraNear.value_or_default();
+        }
+    }
+    else
+    {
+        cameraNear = tempCameraNear;
+        cameraFar = tempCameraFar;
+    }
+
+    if (!Config::Instance()->FsrUseFsrInputValues.value_or_default() ||
+        InParameters->Get("FSR.cameraFovAngleVertical", &cameraVFov) != NVSDK_NGX_Result_Success)
+    {
+        if (Config::Instance()->FsrVerticalFov.has_value())
+            cameraVFov = Config::Instance()->FsrVerticalFov.value() * 0.0174532925199433f;
+        else if (Config::Instance()->FsrHorizontalFov.value_or_default() > 0.0f)
+            cameraVFov = 2.0f * atan((tan(Config::Instance()->FsrHorizontalFov.value() * 0.0174532925199433f) * 0.5f) /
+                                     (float) feature->TargetHeight() * (float) feature->TargetWidth());
+        else
+            cameraVFov = 1.0471975511966f;
+    }
+
+    if (!Config::Instance()->FsrUseFsrInputValues.value_or_default())
+        InParameters->Get("FSR.viewSpaceToMetersFactor", &meterFactor);
+
+    State::Instance().lastFsrCameraFar = cameraFar;
+    State::Instance().lastFsrCameraNear = cameraNear;
 
     auto fg = State::Instance().currentFG;
 
     if (fg == nullptr || State::Instance().activeFgInput != FGInput::Upscaler || _device == nullptr)
         return;
 
-    auto fgConstants = UpscalerInputs::GetFGConstants(feature);
+    FG_Constants fgConstants {};
+    fgConstants.displayWidth = feature->DisplayWidth();
+    fgConstants.displayHeight = feature->DisplayHeight();
+
+    if (feature->IsHdr())
+        fgConstants.flags |= FG_Flags::Hdr;
+
+    if (feature->DepthInverted())
+        fgConstants.flags |= FG_Flags::InvertedDepth;
+
+    if (feature->JitteredMV())
+        fgConstants.flags |= FG_Flags::JitteredMVs;
+
+    if (!feature->LowResMV())
+        fgConstants.flags |= FG_Flags::DisplayResolutionMVs;
+
+    if (Config::Instance()->FGAsync.value_or_default())
+        fgConstants.flags |= FG_Flags::Async;
 
     fg->EvaluateState(_device, fgConstants);
-
-    // Not needed while FG or the option is off, its destructor defers the buffer release
-    if (DepthScale != nullptr &&
-        (!Config::Instance()->IsFGEnabled() || !Config::Instance()->FGEnableDepthScale.value_or_default()))
-    {
-        delete DepthScale;
-        DepthScale = nullptr;
-    }
 
     int reset = 0;
     InParameters->Get(NVSDK_NGX_Parameter_Reset, &reset);
@@ -68,7 +120,7 @@ void UpscalerInputsDx12::UpscaleStart(ID3D12GraphicsCommandList* InCmdList, NVSD
     fg->StartNewFrame();
 
     auto aspectRatio = (float) feature->DisplayWidth() / (float) feature->DisplayHeight();
-    fg->SetCameraValues(camera.cameraNear, camera.cameraFar, camera.cameraVFov, aspectRatio, camera.meterFactor);
+    fg->SetCameraValues(cameraNear, cameraFar, cameraVFov, aspectRatio, meterFactor);
     fg->SetFrameTimeDelta(State::Instance().lastFGFrameTime);
     fg->SetMVScale(mvScaleX, mvScaleY);
     fg->SetJitter(jitterX, jitterY);
@@ -79,7 +131,7 @@ void UpscalerInputsDx12::UpscaleStart(ID3D12GraphicsCommandList* InCmdList, NVSD
 
     // FG Prepare
     UINT frameIndex;
-    if (!State::Instance().isShuttingDown && fg->IsActive() && Config::Instance()->IsFGEnabled() &&
+    if (!State::Instance().isShuttingDown && fg->IsActive() && Config::Instance()->FGEnabled.value_or_default() &&
         State::Instance().currentSwapchain != nullptr)
     {
         // Wait for present
@@ -139,13 +191,13 @@ void UpscalerInputsDx12::UpscaleStart(ID3D12GraphicsCommandList* InCmdList, NVSD
                 if (DepthScale == nullptr)
                     DepthScale = new DS_Dx12("Depth Scale", _device);
 
-                if (DepthScale->CreateBufferResource(_device, paramDepth, 0, 0,
-                                                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS) &&
+                if (DepthScale->CreateBufferResource(_device, paramDepth, feature->DisplayWidth(),
+                                                     feature->DisplayHeight(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS) &&
                     DepthScale->Buffer() != nullptr)
                 {
                     DepthScale->SetBufferState(InCmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-                    if (DepthScale->Dispatch(InCmdList, paramDepth, DepthScale->Buffer()))
+                    if (DepthScale->Dispatch(_device, InCmdList, paramDepth, DepthScale->Buffer()))
                     {
                         Dx12Resource setResource {};
                         setResource.type = FG_ResourceType::Depth;
@@ -154,7 +206,7 @@ void UpscalerInputsDx12::UpscaleStart(ID3D12GraphicsCommandList* InCmdList, NVSD
                         setResource.width = feature->RenderWidth();
                         setResource.height = feature->RenderHeight();
                         setResource.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-                        setResource.validity = FG_ResourceValidity::UntilPresent;
+                        setResource.validity = FG_ResourceValidity::JustTrackCmdlist;
 
                         fg->SetResource(&setResource);
 
@@ -194,7 +246,8 @@ void UpscalerInputsDx12::UpscaleEnd(ID3D12GraphicsCommandList* InCmdList, NVSDK_
         return;
 
     // FG Dispatch
-    if (fg->IsActive() && Config::Instance()->IsFGEnabled() && State::Instance().currentSwapchain != nullptr)
+    if (fg->IsActive() && Config::Instance()->FGEnabled.value_or_default() &&
+        State::Instance().currentSwapchain != nullptr)
     {
         if (Config::Instance()->FGHUDFix.value_or_default())
         {
@@ -204,9 +257,6 @@ void UpscalerInputsDx12::UpscaleEnd(ID3D12GraphicsCommandList* InCmdList, NVSDK_
             ID3D12Resource* output = nullptr;
             if (InParameters->Get(NVSDK_NGX_Parameter_Output, &output) != NVSDK_NGX_Result_Success)
                 InParameters->Get(NVSDK_NGX_Parameter_Output, (void**) &output);
-
-            if (output == nullptr)
-                return;
 
             ResourceInfo info {};
             auto desc = output->GetDesc();

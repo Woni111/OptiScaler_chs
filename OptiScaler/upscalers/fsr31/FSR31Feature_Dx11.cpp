@@ -1,16 +1,24 @@
 #include <pch.h>
 #include <Config.h>
 #include <Util.h>
-#include "FSR31Feature_Dx11.h"
-#include "MathUtils.h"
 
-using namespace OptiMath;
+#include "FSR31Feature_Dx11.h"
 
 #define ASSIGN_DESC(dest, src)                                                                                         \
     dest.Width = src.Width;                                                                                            \
     dest.Height = src.Height;                                                                                          \
     dest.Format = src.Format;                                                                                          \
     dest.BindFlags = src.BindFlags;
+
+#define SAFE_RELEASE(p)                                                                                                \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        if (p && p != nullptr)                                                                                         \
+        {                                                                                                              \
+            (p)->Release();                                                                                            \
+            (p) = nullptr;                                                                                             \
+        }                                                                                                              \
+    } while ((void) 0, 0);
 
 FSR31FeatureDx11::FSR31FeatureDx11(unsigned int InHandleId, NVSDK_NGX_Parameter* InParameters)
     : FSR31Feature(InHandleId, InParameters), IFeature_Dx11(InHandleId, InParameters),
@@ -19,14 +27,29 @@ FSR31FeatureDx11::FSR31FeatureDx11(unsigned int InHandleId, NVSDK_NGX_Parameter*
     _moduleLoaded = true;
 }
 
-bool FSR31FeatureDx11::InitInternal(ID3D11DeviceContext* InContext, NVSDK_NGX_Parameter* InParameters)
+bool FSR31FeatureDx11::Init(ID3D11Device* InDevice, ID3D11DeviceContext* InContext, NVSDK_NGX_Parameter* InParameters)
 {
     LOG_FUNC();
 
     if (IsInited())
         return true;
 
-    return InitFSR3(InParameters);
+    Device = InDevice;
+    DeviceContext = InContext;
+
+    if (InitFSR3(InParameters))
+    {
+        if (!Config::Instance()->OverlayMenu.value_or_default() && (Imgui == nullptr || Imgui.get() == nullptr))
+            Imgui = std::make_unique<Menu_Dx11>(Util::GetProcessWindow(), Device);
+
+        OutputScaler = std::make_unique<OS_Dx11>("Output Scaling", InDevice, (TargetWidth() < DisplayWidth()));
+        RCAS = std::make_unique<RCAS_Dx11>("RCAS", InDevice);
+        Bias = std::make_unique<Bias_Dx11>("Bias", InDevice);
+
+        return true;
+    }
+
+    return false;
 }
 
 // register a DX11 resource to the backend
@@ -59,7 +82,6 @@ bool FSR31FeatureDx11::CopyTexture(ID3D11Resource* InResource, D3D11_TEXTURE2D_R
     if (result != S_OK)
         return false;
 
-    originalTexture->Release();
     originalTexture->GetDesc(&desc);
 
     if (desc.BindFlags == bindFlags)
@@ -113,16 +135,59 @@ void FSR31FeatureDx11::ReleaseResources()
     }
 }
 
-bool FSR31FeatureDx11::EvaluateInternal(ID3D11DeviceContext* DeviceContext, NVSDK_NGX_Parameter* InParameters)
+bool FSR31FeatureDx11::Evaluate(ID3D11DeviceContext* DeviceContext, NVSDK_NGX_Parameter* InParameters)
 {
     LOG_FUNC();
 
     if (!IsInited())
         return false;
 
-    auto& state = State::Instance();
-    auto& cfg = *Config::Instance();
-    const auto& ngxParams = *InParameters;
+    if (!RCAS->IsInit())
+        Config::Instance()->RcasEnabled.set_volatile_value(false);
+
+    if (!OutputScaler->IsInit())
+        Config::Instance()->OutputScalingEnabled.set_volatile_value(false);
+
+    if (Config::Instance()->DADepthIsLinear.value_for_config_ignore_default() == std::nullopt)
+        Config::Instance()->DADepthIsLinear.set_volatile_value(false);
+
+    ID3D11ShaderResourceView* restoreSRVs[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
+    ID3D11SamplerState* restoreSamplerStates[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = {};
+    ID3D11Buffer* restoreCBVs[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = {};
+    ID3D11UnorderedAccessView* restoreUAVs[D3D11_1_UAV_SLOT_COUNT] = {};
+    ID3D11RenderTargetView* restoreRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    ID3D11DepthStencilView* restoreDSV = nullptr;
+
+    // backup compute shader resources
+    for (UINT i = 0; i < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; i++)
+    {
+        restoreSRVs[i] = nullptr;
+        DeviceContext->CSGetShaderResources(i, 1, &restoreSRVs[i]);
+    }
+
+    for (UINT i = 0; i < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT; i++)
+    {
+        restoreSamplerStates[i] = nullptr;
+        DeviceContext->CSGetSamplers(i, 1, &restoreSamplerStates[i]);
+    }
+
+    for (UINT i = 0; i < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; i++)
+    {
+        restoreCBVs[i] = nullptr;
+        DeviceContext->CSGetConstantBuffers(i, 1, &restoreCBVs[i]);
+    }
+
+    for (UINT i = 0; i < D3D11_1_UAV_SLOT_COUNT; i++)
+    {
+        restoreUAVs[i] = nullptr;
+        DeviceContext->CSGetUnorderedAccessViews(i, 1, &restoreUAVs[i]);
+    }
+
+    DeviceContext->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, restoreRTVs, &restoreDSV);
+
+    // Unbind RenderTargets
+    ID3D11RenderTargetView* nullRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    DeviceContext->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, nullRTVs, nullptr);
 
     Fsr31::FfxFsr3DispatchUpscaleDescription params {};
 
@@ -137,8 +202,24 @@ bool FSR31FeatureDx11::EvaluateInternal(ID3D11DeviceContext* DeviceContext, NVSD
     InParameters->Get(NVSDK_NGX_Parameter_Jitter_Offset_X, &params.jitterOffset.x);
     InParameters->Get(NVSDK_NGX_Parameter_Jitter_Offset_Y, &params.jitterOffset.y);
 
-    params.enableSharpening = _sharpness > 0.0f;
-    params.sharpness = _sharpness;
+    if (Config::Instance()->OverrideSharpness.value_or_default())
+        _sharpness = Config::Instance()->Sharpness.value_or_default();
+    else
+        _sharpness = GetSharpness(InParameters);
+
+    if (Config::Instance()->RcasEnabled.value_or_default())
+    {
+        params.enableSharpening = false;
+        params.sharpness = 0.0f;
+    }
+    else
+    {
+        if (_sharpness > 1.0f)
+            _sharpness = 1.0f;
+
+        params.enableSharpening = _sharpness > 0.0f;
+        params.sharpness = _sharpness;
+    }
 
     LOG_DEBUG("Jitter Offset: {0}x{1}", params.jitterOffset.x, params.jitterOffset.y);
 
@@ -147,6 +228,9 @@ bool FSR31FeatureDx11::EvaluateInternal(ID3D11DeviceContext* DeviceContext, NVSD
     params.reset = (reset == 1);
 
     GetRenderResolution(InParameters, &params.renderSize.width, &params.renderSize.height);
+
+    bool useSS =
+        Config::Instance()->OutputScalingEnabled.value_or_default() && (LowResMV() || RenderWidth() == DisplayWidth());
 
     LOG_DEBUG("Input Resolution: {0}x{1}", params.renderSize.width, params.renderSize.height);
 
@@ -202,7 +286,30 @@ bool FSR31FeatureDx11::EvaluateInternal(ID3D11DeviceContext* DeviceContext, NVSD
     if (paramOutput)
     {
         LOG_DEBUG("Output exist..");
-        params.upscaleOutput = ffxGetResource(paramOutput, L"FSR3_Output", Fsr31::FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+
+        if (useSS)
+        {
+            if (OutputScaler->CreateBufferResource(Device, paramOutput, TargetWidth(), TargetHeight()))
+            {
+                params.upscaleOutput =
+                    ffxGetResource(OutputScaler->Buffer(), L"FSR3_Output", Fsr31::FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+            }
+            else
+                params.upscaleOutput =
+                    ffxGetResource(paramOutput, L"FSR3_Output", Fsr31::FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        else
+            params.upscaleOutput =
+                ffxGetResource(paramOutput, L"FSR3_Output", Fsr31::FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+
+        if (Config::Instance()->RcasEnabled.value_or_default() &&
+            (_sharpness > 0.0f || (Config::Instance()->MotionSharpnessEnabled.value_or_default() &&
+                                   Config::Instance()->MotionSharpness.value_or_default() > 0.0f)) &&
+            RCAS->IsInit() && RCAS->CreateBufferResource(Device, (ID3D11Texture2D*) params.upscaleOutput.resource))
+        {
+            params.upscaleOutput =
+                ffxGetResource(RCAS->Buffer(), L"FSR3_Output", Fsr31::FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
     }
     else
     {
@@ -246,7 +353,7 @@ bool FSR31FeatureDx11::EvaluateInternal(ID3D11DeviceContext* DeviceContext, NVSD
         else
         {
             LOG_DEBUG("AutoExposure disabled but ExposureTexture is not exist, it may cause problems!!");
-            State::Instance().autoExposure = true;
+            State::Instance().AutoExposure = true;
             State::Instance().changeBackend[Handle()->Id] = true;
             return true;
         }
@@ -309,28 +416,26 @@ bool FSR31FeatureDx11::EvaluateInternal(ID3D11DeviceContext* DeviceContext, NVSD
 
     if (DepthInverted())
     {
-        params.cameraFar = cfg.FsrCameraNear.value_or_default();
-        params.cameraNear = cfg.FsrCameraFar.value_or_default();
+        params.cameraFar = Config::Instance()->FsrCameraNear.value_or_default();
+        params.cameraNear = Config::Instance()->FsrCameraFar.value_or_default();
     }
     else
     {
-        params.cameraFar = cfg.FsrCameraFar.value_or_default();
-        params.cameraNear = cfg.FsrCameraNear.value_or_default();
+        params.cameraFar = Config::Instance()->FsrCameraFar.value_or_default();
+        params.cameraNear = Config::Instance()->FsrCameraNear.value_or_default();
     }
 
-    state.lastFsrCameraFar = params.cameraFar;
-    state.lastFsrCameraNear = params.cameraNear;
+    State::Instance().lastFsrCameraFar = params.cameraFar;
+    State::Instance().lastFsrCameraNear = params.cameraNear;
 
-    if (cfg.FsrVerticalFov.has_value())
-        params.cameraFovAngleVertical = GetRadiansFromDeg(cfg.FsrVerticalFov.value());
-    else if (cfg.FsrHorizontalFov.value_or_default() > 0.0f)
-    {
-        const float hFovRad = GetRadiansFromDeg(cfg.FsrHorizontalFov.value());
+    if (Config::Instance()->FsrVerticalFov.has_value())
+        params.cameraFovAngleVertical = Config::Instance()->FsrVerticalFov.value() * 0.0174532925199433f;
+    else if (Config::Instance()->FsrHorizontalFov.value_or_default() > 0.0f)
         params.cameraFovAngleVertical =
-            GetVerticalFovFromHorizontal(hFovRad, (float) TargetWidth(), (float) TargetHeight());
-    }
+            2.0f * atan((tan(Config::Instance()->FsrHorizontalFov.value() * 0.0174532925199433f) * 0.5f) /
+                        (float) DisplayHeight() * (float) DisplayWidth());
     else
-        params.cameraFovAngleVertical = GetRadiansFromDeg(60);
+        params.cameraFovAngleVertical = 1.0471975511966f;
 
     LOG_DEBUG("FsrVerticalFov: {0}", params.cameraFovAngleVertical);
 
@@ -388,6 +493,110 @@ bool FSR31FeatureDx11::EvaluateInternal(ID3D11DeviceContext* DeviceContext, NVSD
         return false;
     }
 
+    // apply rcas
+    if (Config::Instance()->RcasEnabled.value_or_default() &&
+        (_sharpness > 0.0f || (Config::Instance()->MotionSharpnessEnabled.value_or_default() &&
+                               Config::Instance()->MotionSharpness.value_or_default() > 0.0f)) &&
+        RCAS != nullptr && RCAS.get() != nullptr && RCAS->CanRender())
+    {
+        RcasConstants rcasConstants {};
+
+        rcasConstants.Sharpness = _sharpness;
+        InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &rcasConstants.MvScaleX);
+        InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &rcasConstants.MvScaleY);
+
+        if (DepthInverted())
+        {
+            rcasConstants.CameraNear = params.cameraFar;
+            rcasConstants.CameraFar = params.cameraNear;
+        }
+        else
+        {
+            rcasConstants.CameraNear = params.cameraNear;
+            rcasConstants.CameraFar = params.cameraFar;
+        }
+
+        if (useSS)
+        {
+            if (!RCAS->Dispatch(Device, DeviceContext, (ID3D11Texture2D*) params.upscaleOutput.resource,
+                                (ID3D11Texture2D*) params.motionVectors.resource, rcasConstants, OutputScaler->Buffer(),
+                                (ID3D11Texture2D*) params.depth.resource))
+            {
+                Config::Instance()->RcasEnabled.set_volatile_value(false);
+                return true;
+            }
+        }
+        else
+        {
+            if (!RCAS->Dispatch(Device, DeviceContext, (ID3D11Texture2D*) params.upscaleOutput.resource,
+                                (ID3D11Texture2D*) params.motionVectors.resource, rcasConstants,
+                                (ID3D11Texture2D*) paramOutput, (ID3D11Texture2D*) params.depth.resource))
+            {
+                Config::Instance()->RcasEnabled.set_volatile_value(false);
+                return true;
+            }
+        }
+    }
+
+    if (useSS)
+    {
+        LOG_DEBUG("scaling output...");
+        if (!OutputScaler->Dispatch(Device, DeviceContext, OutputScaler->Buffer(), (ID3D11Texture2D*) paramOutput))
+        {
+            Config::Instance()->OutputScalingEnabled.set_volatile_value(false);
+            State::Instance().changeBackend[Handle()->Id] = true;
+            return true;
+        }
+    }
+
+    // imgui
+    if (!Config::Instance()->OverlayMenu.value_or_default() && _frameCount > 30)
+    {
+        if (Imgui != nullptr && Imgui.get() != nullptr)
+        {
+            if (Imgui->IsHandleDifferent())
+            {
+                Imgui.reset();
+            }
+            else
+                Imgui->Render(DeviceContext, paramOutput);
+        }
+        else
+        {
+            if (Imgui == nullptr || Imgui.get() == nullptr)
+                Imgui = std::make_unique<Menu_Dx11>(GetForegroundWindow(), Device);
+        }
+    }
+
+    // restore compute shader resources
+    for (UINT i = 0; i < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; i++)
+    {
+        if (restoreSRVs[i] != nullptr)
+            DeviceContext->CSSetShaderResources(i, 1, &restoreSRVs[i]);
+    }
+
+    for (UINT i = 0; i < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT; i++)
+    {
+        if (restoreSamplerStates[i] != nullptr)
+            DeviceContext->CSSetSamplers(i, 1, &restoreSamplerStates[i]);
+    }
+
+    for (UINT i = 0; i < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; i++)
+    {
+        if (restoreCBVs[i] != nullptr)
+            DeviceContext->CSSetConstantBuffers(i, 1, &restoreCBVs[i]);
+    }
+
+    for (UINT i = 0; i < D3D11_1_UAV_SLOT_COUNT; i++)
+    {
+        if (restoreUAVs[i] != nullptr)
+            DeviceContext->CSSetUnorderedAccessViews(i, 1, &restoreUAVs[i], 0);
+    }
+
+    DeviceContext->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, restoreRTVs, restoreDSV);
+
+    _frameCount++;
+
     return true;
 }
 
@@ -433,7 +642,14 @@ bool FSR31FeatureDx11::InitFSR3(const NVSDK_NGX_Parameter* InParameters)
     }
 
     {
-        ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
+        ScopedSkipSpoofing skipSpoofing {};
+
+        uint64_t versionCount = 0;
+        State::Instance().ffxUpscalerVersionIds.resize(versionCount);
+        State::Instance().ffxUpscalerVersionNames.resize(versionCount);
+        State::Instance().ffxUpscalerVersionIds.push_back(1);
+        auto version_number = "3.1.2";
+        State::Instance().ffxUpscalerVersionNames.push_back(version_number);
 
         const size_t scratchBufferSize = Fsr31::ffxGetScratchMemorySizeDX11(1);
         void* scratchBuffer = calloc(scratchBufferSize, 1);
@@ -564,6 +780,10 @@ bool FSR31FeatureDx11::InitFSR3(const NVSDK_NGX_Parameter* InParameters)
             }
         }
 
+        if (Config::Instance()->FfxUpscalerIndex.value_or_default() < 0 ||
+            Config::Instance()->FfxUpscalerIndex.value_or_default() >= State::Instance().ffxUpscalerVersionIds.size())
+            Config::Instance()->FfxUpscalerIndex.set_volatile_value(0);
+
         LOG_DEBUG("_createContext!");
         auto ret = ffxFsr3ContextCreate(&_upscalerContext, &_upscalerContextDesc);
 
@@ -575,8 +795,10 @@ bool FSR31FeatureDx11::InitFSR3(const NVSDK_NGX_Parameter* InParameters)
 
         LOG_INFO("_createContext success!");
 
+        auto version =
+            State::Instance().ffxUpscalerVersionNames[Config::Instance()->FfxUpscalerIndex.value_or_default()];
         _name = "FSR";
-        parse_version("3.1.2");
+        parse_version(version);
     }
 
     SetInit(true);
