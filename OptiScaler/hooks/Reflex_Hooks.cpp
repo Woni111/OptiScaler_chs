@@ -2,13 +2,20 @@
 #include "Reflex_Hooks.h"
 #include <Config.h>
 
-#include <nvapi/fakenvapi.h>
+#include <proxies/Streamline_Proxy.h>
 
 #include <magic_enum.hpp>
 
-// #define LOG_REFLEX_CALLS
+#include <math.h>
+#include <imgui/ImGuiNotify.hpp>
+#include <shaders/reproject/mouseInputs/InputCollection.h>
+#include <low_latency/input/input_common.h>
+#include <misc/FrameLimit.h>
 
-std::optional<TimingEntry> ReflexHooks::timingData[TimingType::TimingTypeCOUNT] {};
+static inline uint64_t _lastFrameId[20] = { 0 };
+static inline IUnknown* _lastDev[20] = { 0 };
+
+// #define LOG_REFLEX_CALLS
 
 NvAPI_Status ReflexHooks::hkNvAPI_D3D_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_PARAMS* pSetSleepModeParams)
 {
@@ -25,10 +32,7 @@ NvAPI_Status ReflexHooks::hkNvAPI_D3D_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_
     if (_minimumIntervalUs != 0)
         pSetSleepModeParams->minimumIntervalUs = _minimumIntervalUs;
 
-    if (State::Instance().activeFgOutput == FGOutput::XeFG && fakenvapi::ForNvidia_SetSleepMode)
-        return fakenvapi::ForNvidia_SetSleepMode(pDev, pSetSleepModeParams);
-    else
-        return o_NvAPI_D3D_SetSleepMode(pDev, pSetSleepModeParams);
+    return o_NvAPI_D3D_SetSleepMode(pDev, pSetSleepModeParams);
 }
 
 NvAPI_Status ReflexHooks::hkNvAPI_D3D_Sleep(IUnknown* pDev)
@@ -37,10 +41,26 @@ NvAPI_Status ReflexHooks::hkNvAPI_D3D_Sleep(IUnknown* pDev)
     LOG_FUNC();
 #endif
 
-    if (State::Instance().activeFgOutput == FGOutput::XeFG && fakenvapi::ForNvidia_Sleep)
-        return fakenvapi::ForNvidia_Sleep(pDev);
+    // Streamline's own sleep comes back here
+    static bool skip = false;
+
+    if (!skip)
+    {
+        skip = true;
+        bool slept = streamlineSleep();
+        skip = false;
+
+        if (slept)
+            return NVAPI_OK;
+    }
     else
+    {
+        _lastSleepDev = pDev;
         return o_NvAPI_D3D_Sleep(pDev);
+    }
+
+    _lastSleepDev = pDev;
+    return o_NvAPI_D3D_Sleep(pDev);
 }
 
 NvAPI_Status ReflexHooks::hkNvAPI_D3D_GetLatency(IUnknown* pDev, NV_LATENCY_RESULT_PARAMS* pGetLatencyParams)
@@ -49,10 +69,16 @@ NvAPI_Status ReflexHooks::hkNvAPI_D3D_GetLatency(IUnknown* pDev, NV_LATENCY_RESU
     LOG_FUNC();
 #endif
 
-    if (State::Instance().activeFgOutput == FGOutput::XeFG && fakenvapi::ForNvidia_GetLatency)
-        return fakenvapi::ForNvidia_GetLatency(pDev, pGetLatencyParams);
-    else
-        return o_NvAPI_D3D_GetLatency(pDev, pGetLatencyParams);
+    return o_NvAPI_D3D_GetLatency(pDev, pGetLatencyParams);
+}
+
+NvAPI_Status ReflexHooks::sendMarker(IUnknown* pDev, NV_LATENCY_MARKER_PARAMS* pSetLatencyMarkerParams,
+                                     bool toStreamline)
+{
+    if (toStreamline)
+        return NVAPI_OK;
+
+    return o_NvAPI_D3D_SetLatencyMarker(pDev, pSetLatencyMarkerParams);
 }
 
 NvAPI_Status ReflexHooks::hkNvAPI_D3D_SetLatencyMarker(IUnknown* pDev,
@@ -61,6 +87,16 @@ NvAPI_Status ReflexHooks::hkNvAPI_D3D_SetLatencyMarker(IUnknown* pDev,
 #ifdef LOG_REFLEX_CALLS
     LOG_FUNC();
 #endif
+
+    // The game's markers are processed by the Reflex input, these come from the Reflex output and OptiScaler's own
+    // Streamline
+    _updatesWithoutMarker = 0;
+    return sendMarker(pDev, pSetLatencyMarkerParams, false);
+}
+
+NvAPI_Status ReflexHooks::processGameMarker(IUnknown* pDev, NV_LATENCY_MARKER_PARAMS* pSetLatencyMarkerParams,
+                                            MarkerSend send)
+{
     _updatesWithoutMarker = 0;
 
     // LOG_DEBUG("frameID: {}, markerType: {}", pSetLatencyMarkerParams->frameID,
@@ -68,12 +104,143 @@ NvAPI_Status ReflexHooks::hkNvAPI_D3D_SetLatencyMarker(IUnknown* pDev,
 
     // Some games just stop sending any async markers when DLSSG is disabled, so a reset is needed
     if (_lastAsyncMarkerFrameId + 10 < pSetLatencyMarkerParams->frameID)
-        _dlssgDetected = false;
+    {
+        _FgNumFramesToGenerate = 0;
+    }
 
-    State::Instance().rtssReflexInjection = pSetLatencyMarkerParams->frameID >> 32;
+    // RTSS reflex markers have a frameid marker in the high bits
+    if (pSetLatencyMarkerParams->frameID >> 32)
+    {
+        if (!State::Instance().rtssReflexInjection && State::Instance().activeFgOutput == FGOutput::XeFG)
+        {
+            ImGuiToast notification { ImGuiToastType::Warning, 10000 };
+            notification.setTitle("RTSS + XeFG detected");
+            notification.setContent(
+                "RTSS Reflex Injection is known to cause issues.\nEspecially when using XeFG.\nPlease disable it.");
+            ImGui::InsertNotification(notification);
+        }
+
+        State::Instance().rtssReflexInjection = true;
+    }
 
     // TODO: reflexFrameId gets constantly changed, up and down depending on the marker
     State::Instance().reflexFrameId = pSetLatencyMarkerParams->frameID;
+
+    // if (pSetLatencyMarkerParams->markerType == PRESENT_END)
+    _lastFrameId[pSetLatencyMarkerParams->markerType] = pSetLatencyMarkerParams->frameID;
+    _lastDev[pSetLatencyMarkerParams->markerType] = pDev;
+
+    if (pSetLatencyMarkerParams->markerType == SIMULATION_START)
+    {
+        InputCollection::getInstance().startCollectingForFrame(pSetLatencyMarkerParams->frameID);
+    }
+    else if (pSetLatencyMarkerParams->markerType == SIMULATION_END)
+    {
+        _lastMarkerFrame = State::Instance().fgLastFrame;
+    }
+
+    static bool skip[20] = {};
+
+    if (State::Instance().activeFgOutput == FGOutput::DLSSG && StreamlineProxy::IsD3D12Inited() &&
+        Config::Instance()->FGDLSSGUseGamesReflexMarkers.value_or_default() && State::Instance().currentFG &&
+        State::Instance().currentFG->IsActive() && !State::Instance().currentFG->IsPaused())
+    {
+        sl::PCLMarker marker {};
+        bool noMarker = false;
+
+        switch (pSetLatencyMarkerParams->markerType)
+        {
+        case SIMULATION_START:
+            marker = sl::PCLMarker::eSimulationStart;
+            break;
+
+        case SIMULATION_END:
+            marker = sl::PCLMarker::eSimulationEnd;
+            break;
+
+        case RENDERSUBMIT_START:
+            marker = sl::PCLMarker::eRenderSubmitStart;
+            break;
+
+        case RENDERSUBMIT_END:
+            marker = sl::PCLMarker::eRenderSubmitEnd;
+            break;
+
+        case PRESENT_START:
+            marker = sl::PCLMarker::ePresentStart;
+            break;
+
+        case PRESENT_END:
+            marker = sl::PCLMarker::ePresentEnd;
+            break;
+
+        case INPUT_SAMPLE:
+            marker = sl::PCLMarker::eControllerInputSample;
+            break;
+
+        case TRIGGER_FLASH:
+            marker = sl::PCLMarker::eTriggerFlash;
+            break;
+
+        case PC_LATENCY_PING:
+            marker = sl::PCLMarker::eDeltaTCalculation;
+            break;
+
+        case OUT_OF_BAND_RENDERSUBMIT_START:
+            marker = sl::PCLMarker::eOutOfBandRenderSubmitStart;
+            break;
+
+        case OUT_OF_BAND_RENDERSUBMIT_END:
+            marker = sl::PCLMarker::eOutOfBandRenderSubmitEnd;
+            break;
+
+        case OUT_OF_BAND_PRESENT_START:
+            marker = sl::PCLMarker::eOutOfBandPresentStart;
+            break;
+
+        case OUT_OF_BAND_PRESENT_END:
+            marker = sl::PCLMarker::eOutOfBandPresentEnd;
+            break;
+
+        default:
+            noMarker = true;
+        }
+
+        auto index = (UINT) marker;
+
+        if (!noMarker && !skip[index])
+        {
+            if (pSetLatencyMarkerParams->markerType == PRESENT_START && State::Instance().currentFG != nullptr)
+            {
+                auto frameCount = State::Instance().currentFG->FrameCount();
+                if (pSetLatencyMarkerParams->frameID - frameCount > 1)
+                    LOG_WARN("FrameId Moved too much??? {} -> {}", frameCount, pSetLatencyMarkerParams->frameID);
+
+                if (pSetLatencyMarkerParams->frameID != frameCount)
+                    State::Instance().currentFG->SetFrameCount(pSetLatencyMarkerParams->frameID);
+
+                State::Instance().reflexFrameId = pSetLatencyMarkerParams->frameID;
+            }
+
+            sl::FrameToken* frameToken;
+            uint32_t frameCount = (uint32_t) pSetLatencyMarkerParams->frameID;
+            StreamlineProxy::GetNewFrameToken()(frameToken, &frameCount);
+
+            LOG_TRACE("{} for frame {}", magic_enum::enum_name(marker), frameCount);
+
+            skip[index] = true;
+            ScopedOptiScalerReflex optiScalerCall {};
+            StreamlineProxy::PCLSetMarker()(marker, *frameToken);
+            skip[index] = false;
+
+            return send(pDev, pSetLatencyMarkerParams, true);
+        }
+        else
+        {
+            // Streamline's copy of the marker comes back here
+            return send(pDev, pSetLatencyMarkerParams, noMarker);
+        }
+    }
 
     if (State::Instance().gameQuirks & GameQuirk::HitmanReflexHacks)
     {
@@ -92,46 +259,46 @@ NvAPI_Status ReflexHooks::hkNvAPI_D3D_SetLatencyMarker(IUnknown* pDev,
             _lastSetSleepThread = std::this_thread::get_id();
 
             newParams.markerType = RENDERSUBMIT_START;
-            hkNvAPI_D3D_SetLatencyMarker(pDev, &newParams);
+            processGameMarker(pDev, &newParams, send);
 
             newParams.markerType = RENDERSUBMIT_END;
-            hkNvAPI_D3D_SetLatencyMarker(pDev, &newParams);
+            processGameMarker(pDev, &newParams, send);
 
             _lastSetSleepThread = previousThread;
         }
     }
 
-    // For now this means that dlssg inputs require fakenvapi, as otherwise hooks won't be called
-    if (pSetLatencyMarkerParams->markerType == RENDERSUBMIT_START && State::Instance().activeFgInput == FGInput::DLSSG)
+    return send(pDev, pSetLatencyMarkerParams, false);
+}
+
+bool ReflexHooks::streamlineSleep()
+{
+    auto& state = State::Instance();
+
+    // With OptiScaler's DLSSG output the game's markers go to its Streamline, which then sleeps for the game
+    if (state.activeFgOutput != FGOutput::DLSSG ||
+        !Config::Instance()->FGDLSSGUseGamesReflexMarkers.value_or_default() || state.currentFG == nullptr ||
+        !state.currentFG->IsActive() || state.currentFG->IsPaused())
     {
-        static ID3D12Device* device12 = nullptr;
-        static IUnknown* lastDevice = nullptr;
-
-        if (pDev != lastDevice)
-        {
-            lastDevice = pDev;
-            device12 = nullptr;
-        }
-
-        if (pDev && !device12)
-        {
-            pDev->QueryInterface(IID_PPV_ARGS(&device12));
-
-            if (device12)
-                device12->Release();
-        }
-
-        if (device12)
-            State::Instance().slFGInputs.evaluateState(device12);
+        return false;
     }
 
-    if (pSetLatencyMarkerParams->markerType == PRESENT_START && State::Instance().activeFgInput == FGInput::DLSSG)
-        State::Instance().slFGInputs.markPresent(pSetLatencyMarkerParams->frameID);
+    uint32_t frameCount = (uint32_t) _lastFrameId[SIMULATION_START] + 1;
 
-    if (State::Instance().activeFgOutput == FGOutput::XeFG && fakenvapi::ForNvidia_SetLatencyMarker)
-        return fakenvapi::ForNvidia_SetLatencyMarker(pDev, pSetLatencyMarkerParams);
-    else
-        return o_NvAPI_D3D_SetLatencyMarker(pDev, pSetLatencyMarkerParams);
+    sl::FrameToken* frameToken;
+    StreamlineProxy::GetNewFrameToken()(frameToken, &frameCount);
+
+    LOG_TRACE("Sleep for frame {}", frameCount);
+
+    ScopedOptiScalerReflex optiScalerCall {};
+    StreamlineProxy::ReflexSleep()(*frameToken);
+    return true;
+}
+
+void ReflexHooks::gameSetSleepMode()
+{
+    if (State::Instance().gameQuirks & GameQuirk::HitmanReflexHacks)
+        _lastSetSleepThread = std::this_thread::get_id();
 }
 
 NvAPI_Status ReflexHooks::hkNvAPI_D3D12_SetAsyncFrameMarker(ID3D12CommandQueue* pCommandQueue,
@@ -143,42 +310,100 @@ NvAPI_Status ReflexHooks::hkNvAPI_D3D12_SetAsyncFrameMarker(ID3D12CommandQueue* 
 
     _lastAsyncMarkerFrameId = pSetAsyncFrameMarkerParams->frameID;
 
-    if (pSetAsyncFrameMarkerParams->markerType == OUT_OF_BAND_PRESENT_START)
+    // if (pSetAsyncFrameMarkerParams->markerType == OUT_OF_BAND_PRESENT_START)
+    //{
+    //     constexpr size_t history_size = 20;
+    //     static size_t counter = 0;
+    //     static NvU64 previous_frame_ids[history_size] = {};
+
+    //    previous_frame_ids[counter % history_size] = pSetAsyncFrameMarkerParams->frameID;
+    //    counter++;
+
+    //    size_t valid_count = (counter < history_size) ? counter : history_size;
+
+    //    size_t max_run_length = 1;
+    //    size_t current_run = 1;
+
+    //    for (size_t i = 1; i < valid_count; i++)
+    //    {
+    //        if (previous_frame_ids[i] == previous_frame_ids[i - 1])
+    //        {
+    //            current_run++;
+    //        }
+    //        else
+    //        {
+    //            max_run_length = std::max(max_run_length, current_run);
+    //            current_run = 1;
+    //        }
+    //    }
+
+    //    max_run_length = std::max(max_run_length, current_run);
+
+    //    int detected_mode = 0;
+    //    if (max_run_length >= 4)
+    //        detected_mode = 3;
+    //    else if (max_run_length == 3)
+    //        detected_mode = 2;
+    //    else if (max_run_length == 2)
+    //        detected_mode = 1;
+
+    //    // --- Stability filter ---
+    //    static int candidate_mode = 0; // No FG at start
+    //    static int candidate_count = 0;
+    //    constexpr int stability_threshold = 4;
+
+    //    if (detected_mode == candidate_mode)
+    //    {
+    //        candidate_count++;
+    //    }
+    //    else
+    //    {
+    //        candidate_mode = detected_mode;
+    //        candidate_count = 1;
+    //    }
+
+    //    // Redundant
+    //    // max_run_length = std::max(max_run_length, current_run);
+
+    //    // Only commit after stable detection
+    //    if (candidate_count >= stability_threshold)
+    //    {
+    //        if (candidate_mode == 0 && _FgNumFramesToGenerate > 0)
+    //        {
+    //            _FgNumFramesToGenerate = 0;
+    //            LOG_DEBUG("DLSS FG no longer detected");
+    //        }
+    //        else if (_FgNumFramesToGenerate != candidate_mode)
+    //        {
+    //            _FgNumFramesToGenerate = candidate_mode;
+
+    //            LOG_DEBUG("DLSS FG detected: {}x mode", candidate_mode + 1);
+    //        }
+    //    }
+    //}
+
+    return o_NvAPI_D3D12_SetAsyncFrameMarker(pCommandQueue, pSetAsyncFrameMarkerParams);
+}
+
+void* ReflexHooks::getHookedReflexSync(PFN_NvApi_QueryInterface& queryInterface)
+{
+    if (o_NvAPI_D3D_SetReflexSync == nullptr && queryInterface != nullptr)
+        o_NvAPI_D3D_SetReflexSync = GET_INTERFACE(NvAPI_D3D_SetReflexSync, queryInterface);
+
+    return o_NvAPI_D3D_SetReflexSync != nullptr ? (void*) &hkNvAPI_D3D_SetReflexSync : nullptr;
+}
+
+NvAPI_Status ReflexHooks::hkNvAPI_D3D_SetReflexSync(IUnknown* pDev, NV_SET_REFLEX_SYNC_PARAMS* pSetReflexSyncParams)
+{
+    // With the Reflex output OptiScaler's FSR-FG and XeFG report their own frame multiplier, the game's Streamline
+    // doesn't know it
+    if (InputCommon::active_output() == LowLatencyMode::Reflex &&
+        (State::Instance().activeFgOutput == FGOutput::FSRFG || State::Instance().activeFgOutput == FGOutput::XeFG))
     {
-        constexpr size_t history_size = 12;
-        static size_t counter = 0;
-        static NvU64 previous_frame_ids[history_size] = {};
-
-        previous_frame_ids[counter % history_size] = pSetAsyncFrameMarkerParams->frameID;
-        counter++;
-
-        size_t repeat_count = 0;
-
-        for (size_t i = 1; i < history_size; i++)
-        {
-            // won't catch repeat frame ids across array wrap around
-            if (previous_frame_ids[i] == previous_frame_ids[i - 1])
-            {
-                repeat_count++;
-            }
-        }
-
-        if (_dlssgDetected && repeat_count == 0)
-        {
-            _dlssgDetected = false;
-            LOG_DEBUG("DLSS FG no longer detected");
-        }
-        else if (!_dlssgDetected && repeat_count >= history_size / 2 - 1)
-        {
-            _dlssgDetected = true;
-            LOG_DEBUG("DLSS FG detected");
-        }
+        return NVAPI_OK;
     }
 
-    if (State::Instance().activeFgOutput == FGOutput::XeFG && fakenvapi::ForNvidia_SetAsyncFrameMarker)
-        return fakenvapi::ForNvidia_SetAsyncFrameMarker(pCommandQueue, pSetAsyncFrameMarkerParams);
-    else
-        return o_NvAPI_D3D12_SetAsyncFrameMarker(pCommandQueue, pSetAsyncFrameMarkerParams);
+    return o_NvAPI_D3D_SetReflexSync(pDev, pSetReflexSyncParams);
 }
 
 NvAPI_Status ReflexHooks::hkNvAPI_Vulkan_SetLatencyMarker(HANDLE vkDevice,
@@ -189,6 +414,7 @@ NvAPI_Status ReflexHooks::hkNvAPI_Vulkan_SetLatencyMarker(HANDLE vkDevice,
 #endif
 
     _updatesWithoutMarker = 0;
+    State::Instance().reflexFrameId = pSetLatencyMarkerParams->frameID;
 
     return o_NvAPI_Vulkan_SetLatencyMarker(vkDevice, pSetLatencyMarkerParams);
 }
@@ -209,6 +435,15 @@ NvAPI_Status ReflexHooks::hkNvAPI_Vulkan_SetSleepMode(HANDLE vkDevice,
     return o_NvAPI_Vulkan_SetSleepMode(vkDevice, pSetSleepModeParams);
 }
 
+NvAPI_Status ReflexHooks::hkNvAPI_Vulkan_GetLatency(HANDLE vkDevice, NV_VULKAN_LATENCY_RESULT_PARAMS* pGetLatencyParams)
+{
+#ifdef LOG_REFLEX_CALLS
+    LOG_FUNC();
+#endif
+
+    return o_NvAPI_Vulkan_GetLatency(vkDevice, pGetLatencyParams);
+}
+
 void ReflexHooks::hookReflex(PFN_NvApi_QueryInterface& queryInterface)
 {
     if (!_inited)
@@ -224,18 +459,20 @@ void ReflexHooks::hookReflex(PFN_NvApi_QueryInterface& queryInterface)
         o_NvAPI_D3D12_SetAsyncFrameMarker = GET_INTERFACE(NvAPI_D3D12_SetAsyncFrameMarker, queryInterface);
         o_NvAPI_Vulkan_SetLatencyMarker = GET_INTERFACE(NvAPI_Vulkan_SetLatencyMarker, queryInterface);
         o_NvAPI_Vulkan_SetSleepMode = GET_INTERFACE(NvAPI_Vulkan_SetSleepMode, queryInterface);
+        o_NvAPI_Vulkan_GetLatency = GET_INTERFACE(NvAPI_Vulkan_GetLatency, queryInterface);
 
         _inited = o_NvAPI_D3D_SetSleepMode && o_NvAPI_D3D_Sleep && o_NvAPI_D3D_GetLatency &&
-                  o_NvAPI_D3D_SetLatencyMarker && o_NvAPI_D3D12_SetAsyncFrameMarker;
+                  o_NvAPI_D3D_SetLatencyMarker && o_NvAPI_D3D12_SetAsyncFrameMarker &&
+                  o_NvAPI_Vulkan_SetLatencyMarker && o_NvAPI_Vulkan_SetSleepMode && o_NvAPI_Vulkan_GetLatency;
 
         if (_inited)
             LOG_DEBUG("Inited Reflex hooks");
     }
 }
 
-bool ReflexHooks::isDlssgDetected() { return _dlssgDetected; }
+uint8_t ReflexHooks::dlssgFrameCountToGenerate() { return _FgNumFramesToGenerate; }
 
-void ReflexHooks::setDlssgDetectedState(bool state) { _dlssgDetected = state; }
+void ReflexHooks::setDlssgFrameCount(uint8_t count) { _FgNumFramesToGenerate = count; }
 
 bool ReflexHooks::isReflexHooked() { return _inited; }
 
@@ -269,75 +506,16 @@ void* ReflexHooks::getHookedReflex(unsigned int InterfaceId)
     {
         return &hkNvAPI_Vulkan_SetSleepMode;
     }
+    if (InterfaceId == GET_ID(NvAPI_Vulkan_GetLatency) && o_NvAPI_Vulkan_GetLatency)
+    {
+        return &hkNvAPI_Vulkan_GetLatency;
+    }
 
     return nullptr;
 }
 
-#define UPDATE_TIMING_ENTRY(name, type)                                                                                \
-    if (frameReport.name##EndTime >= frameReport.name##StartTime)                                                      \
-    {                                                                                                                  \
-        double name##Pos = (double) (frameReport.name##StartTime - start) / rangeNs;                                   \
-        double name##Length = (double) (frameReport.name##EndTime - frameReport.name##StartTime) / rangeNs;            \
-        timingData[TimingType::type] = TimingEntry { .position = name##Pos, .length = name##Length };                  \
-    }                                                                                                                  \
-    else                                                                                                               \
-    {                                                                                                                  \
-        timingData[TimingType::type].reset();                                                                          \
-    }
-
-bool ReflexHooks::updateTimingData()
-{
-    bool canCall = ((State::Instance().activeFgOutput == FGOutput::XeFG && fakenvapi::ForNvidia_GetLatency) ||
-                    o_NvAPI_D3D_GetLatency);
-
-    if (!canCall || !_lastSleepDev)
-        return false;
-
-    NV_LATENCY_RESULT_PARAMS results {};
-    results.version = NV_LATENCY_RESULT_PARAMS_VER;
-
-    if (auto result = hkNvAPI_D3D_GetLatency(_lastSleepDev, &results); result != NVAPI_OK)
-        return false;
-
-    // 64th element have the latest data
-    auto& frameReport = results.frameReport[63];
-
-    uint64_t start = UINT64_MAX;
-    uint64_t end = 0;
-
-    // Please don't look, just thought it would be least work
-    auto pTimes = (uint64_t*) &frameReport.simStartTime;
-    for (auto i = 0; i < 11; i++)
-    {
-        auto& time = pTimes[i];
-        if (time == 0)
-            continue;
-
-        if (time < start)
-            start = time;
-
-        if (time > end)
-            end = time;
-    }
-
-    if (end < start)
-        return false;
-
-    double rangeNs = static_cast<double>(end - start);
-
-    timingData[TimingType::TimeRange] = TimingEntry { .position = 0, .length = rangeNs };
-    UPDATE_TIMING_ENTRY(sim, Simulation)
-    UPDATE_TIMING_ENTRY(renderSubmit, RenderSubmit)
-    UPDATE_TIMING_ENTRY(present, Present)
-    UPDATE_TIMING_ENTRY(driver, Driver)
-    UPDATE_TIMING_ENTRY(osRenderQueue, OsRenderQueue)
-    UPDATE_TIMING_ENTRY(gpuRender, GpuRender)
-
-    return true;
-}
-
 // For updating information about Reflex hooks
-void ReflexHooks::update(bool optiFg_FgState, bool isVulkan)
+void ReflexHooks::update(bool fgActive, bool isVulkan)
 {
     // We can still use just the markers to limit the fps with Reflex disabled
     // But need to fallback in case a game stops sending them for some reason
@@ -345,39 +523,36 @@ void ReflexHooks::update(bool optiFg_FgState, bool isVulkan)
 
     State::Instance().reflexShowWarning = false;
 
+    // The game's D3D Reflex only reaches the driver through the Reflex output
+    bool reflexOutput = InputCommon::active_output() == LowLatencyMode::Reflex;
+
     if (_updatesWithoutMarker > 20 || !_inited)
     {
         State::Instance().reflexLimitsFps = false;
         return;
     }
 
-    if (isVulkan)
+    if (isVulkan && _lastVkSleepDev)
     {
-        // optiFg_FgState doesn't matter for vulkan
-        // isUsingFakenvapi() because fakenvapi might override the reflex' setting and we don't know it
-        State::Instance().reflexLimitsFps = fakenvapi::isUsingFakenvapi() || _lastVkSleepParams.bLowLatencyMode;
+        // fgActive doesn't matter for vulkan
+        State::Instance().reflexLimitsFps = _lastVkSleepParams.bLowLatencyMode;
+    }
+    else if (!reflexOutput)
+    {
+        // The low latency inputs limit through the other outputs themselves
+        State::Instance().reflexLimitsFps = false;
+    }
+    else if (_lastSleepDev)
+    {
+        // Don't use when: Real Reflex markers + FSR FG + Reflex disabled, causes huge input latency
+        State::Instance().reflexLimitsFps = !fgActive || _lastSleepParams.bLowLatencyMode;
+        State::Instance().reflexShowWarning =
+            State::Instance().activeFgOutput == FGOutput::FSRFG && fgActive && _lastSleepParams.bLowLatencyMode;
     }
     else
     {
-        // Don't use when: Real Reflex markers + OptiFG + Reflex disabled, causes huge input latency
-        State::Instance().reflexLimitsFps =
-            fakenvapi::isUsingFakenvapi() || !optiFg_FgState || _lastSleepParams.bLowLatencyMode;
-        State::Instance().reflexShowWarning = State::Instance().activeFgOutput != FGOutput::XeFG &&
-                                              !fakenvapi::isUsingFakenvapi() && optiFg_FgState &&
-                                              _lastSleepParams.bLowLatencyMode;
+        State::Instance().reflexLimitsFps = false;
     }
-
-    // Disable reflex fps limiting when reflex is force disabled
-    // TODO: It changes without pressing apply, XeLL with XeFG can't actually be disabled so this is wrong
-    //
-    // Wait for fakenvapi to be merged into Opti for better integration
-    //
-    // if (State::Instance().reflexLimitsFps && (fakenvapi::isUsingFakenvapi() || fakenvapi::isUsingFakenvapiOnNvidia())
-    // &&
-    //    Config::Instance()->FN_ForceReflex.value_or_default() == 1)
-    //{
-    //    State::Instance().reflexLimitsFps = false;
-    //}
 
     static float lastFps = 0;
     static bool lastReflexLimitsFps = State::Instance().reflexLimitsFps;
@@ -393,23 +568,31 @@ void ReflexHooks::update(bool optiFg_FgState, bool isVulkan)
     if (!State::Instance().reflexLimitsFps)
         return;
 
-    float currentFps = Config::Instance()->FramerateLimit.value_or_default();
-    static bool lastDlssgDetectedState = false;
+    // The FPS limit, or XeFG's Dynamic MFG target while it runs as a cap
+    float currentFps = FrameLimit::targetFps();
+    static uint8_t lastFgNumFramesToGenerate = 0;
 
-    if (lastDlssgDetectedState != _dlssgDetected)
+    if (lastFgNumFramesToGenerate != _FgNumFramesToGenerate)
     {
-        lastDlssgDetectedState = _dlssgDetected;
+        lastFgNumFramesToGenerate = _FgNumFramesToGenerate;
         setFPSLimit(currentFps);
 
-        if (_dlssgDetected)
-            LOG_DEBUG("DLSS FG detected");
-        else
+        if (_FgNumFramesToGenerate == 0)
             LOG_DEBUG("DLSS FG no longer detected");
+        else
+            LOG_DEBUG("DLSS FG detected, mode: {}x", _FgNumFramesToGenerate + 1);
     }
 
-    if ((optiFg_FgState && State::Instance().activeFgOutput == FGOutput::FSRFG) ||
-        (_dlssgDetected && fakenvapi::isUsingFakenvapi()))
-        currentFps /= 2;
+    // TODO: replace fgActive with _FgNumFramesToGenerate
+    // _FgNumFramesToGenerate needs to be correctly updated
+    if (fgActive && State::Instance().activeFgOutput == FGOutput::FSRFG)
+    {
+        // The Reflex output reports FSR-FG's frame multiplier (Reflex Sync), the driver limits the output frames
+        bool driverCountsFg = reflexOutput && InputCommon::output_reports_fg_multiplier();
+
+        if (!driverCountsFg)
+            currentFps /= 2;
+    }
 
     if (currentFps != lastFps)
     {
@@ -433,10 +616,7 @@ void ReflexHooks::setFPSLimit(float fps)
         memcpy(&temp, &_lastSleepParams, sizeof(NV_SET_SLEEP_MODE_PARAMS));
         temp.minimumIntervalUs = _minimumIntervalUs;
 
-        if (State::Instance().activeFgOutput == FGOutput::XeFG && fakenvapi::ForNvidia_SetSleepMode)
-            fakenvapi::ForNvidia_SetSleepMode(_lastSleepDev, &temp);
-        else
-            o_NvAPI_D3D_SetSleepMode(_lastSleepDev, &temp);
+        o_NvAPI_D3D_SetSleepMode(_lastSleepDev, &temp);
     }
 
     if (_lastVkSleepDev != nullptr)
@@ -446,4 +626,10 @@ void ReflexHooks::setFPSLimit(float fps)
         temp.minimumIntervalUs = _minimumIntervalUs;
         o_NvAPI_Vulkan_SetSleepMode(_lastVkSleepDev, &temp);
     }
+}
+
+bool ReflexHooks::gameIsSendingMarkers()
+{
+    return _lastMarkerFrame != 0 && ((State::Instance().fgLastFrame < _lastMarkerFrame) ||
+                                     (State::Instance().fgLastFrame - _lastMarkerFrame) < 5);
 }

@@ -8,11 +8,21 @@ class DLSSDFeatureDx11 : public DLSSDFeature, public IFeature_Dx11
   private:
   protected:
   public:
-    bool Init(ID3D11Device* InDevice, ID3D11DeviceContext* InContext, NVSDK_NGX_Parameter* InParameters) override;
-    bool Evaluate(ID3D11DeviceContext* InDeviceContext, NVSDK_NGX_Parameter* InParameters) override;
+    bool InitInternal(ID3D11DeviceContext* InContext, NVSDK_NGX_Parameter* InParameters) override;
+    bool EvaluateInternal(ID3D11DeviceContext* InDeviceContext, NVSDK_NGX_Parameter* InParameters) override;
 
     feature_version Version() override { return DLSSDFeature::Version(); }
-    std::string Name() const override { return DLSSDFeature::Name(); }
+    Upscaler GetUpscalerType() const final { return DLSSDFeature::GetUpscalerType(); }
+    API Api() const override { return IFeature_Dx11::Api(); }
+    bool CallsUpscalerEndByItself() override { return IFeature_Dx11::CallsUpscalerEndByItself(); }
+    std::optional<double> ReadUpscalerTime(void* commandQueue) override
+    {
+        return IFeature_Dx11::ReadUpscalerTime(commandQueue);
+    };
+    void ReadDetailedGpuTimes(void* commandQueue, std::vector<DetailedGpuTime>& detailedGpuTimes) override
+    {
+        return IFeature_Dx11::ReadDetailedGpuTimes(commandQueue, detailedGpuTimes);
+    };
 
     bool IsWithDx12() override { return false; }
 

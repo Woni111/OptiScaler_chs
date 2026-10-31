@@ -113,6 +113,8 @@ static bool CreateDLSSContext(Fsr3::FfxFsr3UpscalerContext* handle,
     if ((initParams->flags & Fsr3::FFX_FSR3UPSCALER_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS) == 0)
         initFlags |= NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
 
+    State::Instance().dynamicResolution = (initParams->flags & Fsr3::FFX_FSR3UPSCALER_ENABLE_DYNAMIC_RESOLUTION) != 0;
+
     params->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, initFlags);
 
     params->Set(NVSDK_NGX_Parameter_Width, pExecParams->renderSize.width);
@@ -253,12 +255,15 @@ static Fsr3::FfxErrorCode ffxFsr3ContextCreate_Dx12(Fsr3::FfxFsr3UpscalerContext
         _d3d12Device = state.d3d12Devices[state.d3d12Devices.size() - 1];
 
     if (_d3d12Device == nullptr)
+        _d3d12Device = state.currentD3D12Device;
+
+    if (_d3d12Device == nullptr)
     {
-        LOG_WARN("D3D12 device not found!");
+        LOG_ERROR("D3D12 device not found!");
         return ccResult;
     }
 
-    if (!state.NvngxDx12Inited)
+    if (!state.nvngxDx12Inited)
     {
         NVSDK_NGX_FeatureCommonInfo fcInfo {};
         auto exePath = Util::ExePath().remove_filename();
@@ -372,7 +377,7 @@ static Fsr3::FfxErrorCode ffxFsr3ContextDispatch_Dx12(Fsr3::FfxFsr3UpscalerConte
     LOG_DEBUG("handle: {:X}, internalResolution: {}x{}", handle->Id, pDispatchDescription->renderSize.width,
               pDispatchDescription->renderSize.height);
 
-    State::Instance().setInputApiName = "FSR3-DX12";
+    State::Instance().setInputApiName = ApiUpscalerInput::FSR3_DX12;
 
     auto evalResult = NVSDK_NGX_D3D12_EvaluateFeature((ID3D12GraphicsCommandList*) pDispatchDescription->commandList,
                                                       handle, params, nullptr);
@@ -454,12 +459,15 @@ ffxFsr3ContextCreate_Pattern_Dx12(Fsr3::FfxFsr3UpscalerContext* pContext,
         _d3d12Device = state.d3d12Devices[state.d3d12Devices.size() - 1];
 
     if (_d3d12Device == nullptr)
+        _d3d12Device = state.currentD3D12Device;
+
+    if (_d3d12Device == nullptr)
     {
-        LOG_WARN("D3D12 device not found!");
+        LOG_ERROR("D3D12 device not found!");
         return ccResult;
     }
 
-    if (!state.NvngxDx12Inited)
+    if (!state.nvngxDx12Inited)
     {
         NVSDK_NGX_FeatureCommonInfo fcInfo {};
 
@@ -565,7 +573,7 @@ ffxFsr3ContextDispatch_Pattern_Dx12(Fsr3::FfxFsr3UpscalerContext* pContext,
     LOG_DEBUG("handle: {:X}, internalResolution: {}x{}", handle->Id, pDispatchDescription->renderSize.width,
               pDispatchDescription->renderSize.height);
 
-    State::Instance().setInputApiName = "FSR3-DX12";
+    State::Instance().setInputApiName = ApiUpscalerInput::FSR3_DX12;
 
     auto evalResult = NVSDK_NGX_D3D12_EvaluateFeature((ID3D12GraphicsCommandList*) pDispatchDescription->commandList,
                                                       handle, params, nullptr);

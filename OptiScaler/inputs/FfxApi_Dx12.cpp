@@ -87,6 +87,8 @@ static bool CreateDLSSContext(ffxContext handle, const ffxDispatchDescUpscale* p
     if ((initParams->flags & FFX_UPSCALE_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS) == 0)
         initFlags |= NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
 
+    State::Instance().dynamicResolution = (initParams->flags & FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION) != 0;
+
     params->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, initFlags);
 
     params->Set(NVSDK_NGX_Parameter_Width, pExecParams->renderSize.width);
@@ -207,12 +209,14 @@ ffxReturnCode_t ffxCreateContext_Dx12(ffxContext* context, ffxCreateContextDescH
     // Game is creating FSR-FG swapchain and calling present twice per frame
     // So when using OptiFG I am hijacking FSR-FG swapchain
     // It would crash the games which uses swapchain for FG
-    if ((type == FFXStructType::SwapchainDX12 || type == FFXStructType::FG) &&
-        (state.activeFgInput == FGInput::FSRFG ||
-         (Config::Instance()->FGAlwaysCaptureFSRFGSwapchain.value_or_default() &&
-          state.activeFgOutput != FGOutput::NoFG && state.activeFgOutput != FGOutput::Nukems &&
-          (desc->type == FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_NEW_DX12 ||
-           desc->type == FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_FOR_HWND_DX12))))
+    const bool isFgType = type == FFXStructType::SwapchainDX12 || type == FFXStructType::FG;
+    const bool swapchainCreationType =
+        desc->type == FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_NEW_DX12 ||
+        desc->type == FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_FOR_HWND_DX12;
+    const bool unaffectedOutput = state.activeFgOutput == FGOutput::NoFG || state.activeFgInput == FGInput::NvngxFG;
+    const bool shouldCaptureGamesSwapchain = Config::Instance()->FGAlwaysCaptureFSRFGSwapchain.value_or_default() &&
+                                             !unaffectedOutput && swapchainCreationType;
+    if (isFgType && (state.activeFgInput == FGInput::FSRFG || shouldCaptureGamesSwapchain))
     {
         auto result = ffxCreateContext_Dx12FG(context, desc, memCb);
 
@@ -255,7 +259,7 @@ ffxReturnCode_t ffxCreateContext_Dx12(ffxContext* context, ffxCreateContextDescH
             return ffxApiResult;
     }
 
-    if (!state.NvngxDx12Inited)
+    if (!state.nvngxDx12Inited)
     {
         NVSDK_NGX_FeatureCommonInfo fcInfo {};
         auto exePath = Util::ExePath().remove_filename();
@@ -401,6 +405,14 @@ ffxReturnCode_t ffxQuery_Dx12(ffxContext* context, ffxQueryDescHeader* desc)
 
     auto type = FfxApiProxy::GetIndirectType(desc);
     LOG_DEBUG("Header type: {}, Indirect type: {}", FfxApiProxy::GetTypeName(desc->type), magic_enum::enum_name(type));
+
+    if (desc->type == FFX_API_QUERY_DESC_TYPE_GET_VERSIONS && type == FFXStructType::Upscaling &&
+        State::Instance().gameQuirks & GameQuirk::HideFsr4)
+    {
+        return FfxApiProxy::QueryUpscalerVersionsWithoutFsr4(reinterpret_cast<ffxQueryDescGetVersions*>(desc),
+                                                             [context](ffxQueryDescHeader* query)
+                                                             { return FfxApiProxy::D3D12_Query(context, query); });
+    }
 
     if (type == FFXStructType::SwapchainDX12 || type == FFXStructType::FG)
     {
@@ -654,7 +666,7 @@ ffxReturnCode_t ffxDispatch_Dx12(ffxContext* context, ffxDispatchDescHeader* des
     LOG_DEBUG("handle: {:X}, internalResolution: {}x{}", handle->Id, dispatchDesc->renderSize.width,
               dispatchDesc->renderSize.height);
 
-    State::Instance().setInputApiName = "FFX-DX12";
+    State::Instance().setInputApiName = ApiUpscalerInput::FFX_DX12;
 
     auto evalResult = NVSDK_NGX_D3D12_EvaluateFeature((ID3D12GraphicsCommandList*) dispatchDesc->commandList, handle,
                                                       params, nullptr);

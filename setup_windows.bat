@@ -15,7 +15,7 @@ echo #+#    #+# #+#            #+#         #+#     #+#    #+# #+#    #+# #+#    
 echo  ########  ###            ###     ###########  ########   ########  ###     ### ########## ########## ###    ### 
 echo.
 echo Coping is strong with this one...
-echo v2.8 - now with OptiPatcher support
+echo v3.0-pre1（汉化版）
 echo.
 
 del "!! README_EXTRACT ALL FILES TO GAME FOLDER !!.txt" 2>nul
@@ -294,7 +294,7 @@ if "%gpuChoice%"=="1" (
 
 :checkExistingOptiPatcher
 set "foundOptiPatcher="
-for %%F in (plugins\*OptiPatcher*.asi) do (
+for %%F in (OptiScaler\plugins\*OptiPatcher*.asi) do (
     set "foundOptiPatcher=%%F"
 )
 
@@ -358,15 +358,15 @@ if "!OPTI_MATCH!"=="YES" (
     if "!downloadOptiPatcher!"=="1" (
         echo.
         echo 正在准备 plugins 文件夹...
-        if not exist "plugins" mkdir "plugins"
+        if not exist "OptiScaler\plugins" mkdir "OptiScaler\plugins"
         
         echo 正在下载 OptiPatcher...
         echo 下载超时限制 60 秒，失败自动跳过。
         echo.
-        powershell -Command "Invoke-WebRequest -Uri 'https://github.com/optiscaler/OptiPatcher/releases/download/rolling/OptiPatcher.asi' -OutFile 'plugins\OptiPatcher.asi'"
+        powershell -Command "$url='https://github.com/optiscaler/OptiPatcher/releases/download/rolling/OptiPatcher.asi'; try { Invoke-WebRequest -Uri $url -OutFile 'OptiScaler\plugins\OptiPatcher.asi' -TimeoutSec 60 } catch { try { Invoke-WebRequest -Uri ('https://ghfast.top/'+$url) -OutFile 'OptiScaler\plugins\OptiPatcher.asi' -TimeoutSec 60 } catch { try { Invoke-WebRequest -Uri ('https://gh-proxy.com/'+$url) -OutFile 'OptiScaler\plugins\OptiPatcher.asi' -TimeoutSec 60 } catch { try { Invoke-WebRequest -Uri ('https://ghproxy.net/'+$url) -OutFile 'OptiScaler\plugins\OptiPatcher.asi' -TimeoutSec 60 } catch {} } } }
         if errorlevel 1 goto completeSetup
         
-        if exist "plugins\OptiPatcher.asi" (
+        if exist "OptiScaler\plugins\OptiPatcher.asi" (
             echo OptiPatcher.asi 下载成功。
             echo 正在启用 OptiScaler.ini 中的 ASI 加载...
             if exist "%configFile%" (
@@ -486,22 +486,22 @@ echo if "%%removeChoice%%"=="1" ^(
 echo     del OptiScaler.log
 echo     del OptiScaler.ini
 echo     del OptiScaler.asi
-echo     del fakenvapi.dll
-echo     del fakenvapi.ini
-echo     del fakenvapi.log
-echo     del dlssg_to_fsr3_amd_is_better.dll
-echo     del dlssg_to_fsr3.log
-echo     del /Q D3D12_Optiscaler\*
-echo     rd D3D12_Optiscaler
-echo     del /Q DlssOverrides\*
-echo     rd DlssOverrides
+echo     for %%%%F in ^(!OPTI_DLL_LIST!^) do ^(del "%%%%F"^)
 echo     del /Q Licenses\*
 echo     rd Licenses
-echo     for %%%%F in ^(!OPTI_DLL_LIST!^) do ^(del "%%%%F"^)
+echo     del /Q OptiScaler\D3D12_Optiscaler\*
+echo     rd OptiScaler\D3D12_Optiscaler
+echo     del /Q OptiScaler\Streamline\*
+echo     rd OptiScaler\Streamline
+echo     del /Q OptiScaler\streamline\*
+echo     rd OptiScaler\streamline
 echo     echo.
 echo     echo 删除 OptiPatcher（如果存在）
-echo     del plugins\OptiPatcher.asi
-echo     rd plugins
+echo     del /Q OptiScaler\plugins\*
+echo     rd OptiScaler\plugins
+echo     echo.
+echo     del /Q OptiScaler\*
+echo     rd OptiScaler
 echo     echo.
 echo     echo OptiScaler 已卸载！忽略关于缺失文件的警告。
 echo     echo.

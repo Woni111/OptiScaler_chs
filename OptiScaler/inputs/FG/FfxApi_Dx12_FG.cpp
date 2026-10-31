@@ -4,6 +4,7 @@
 
 #include <Util.h>
 #include <Config.h>
+#include <misc/DeferredRelease.h>
 
 #include <magic_enum.hpp>
 
@@ -189,8 +190,8 @@ static bool CreateBufferResource(ID3D12Device* InDevice, ID3D12Resource* InResou
 
         if (bufDesc.Width != inDesc.Width || bufDesc.Height != inDesc.Height || bufDesc.Format != inDesc.Format)
         {
-            (*OutResource)->Release();
-            (*OutResource) = nullptr;
+            // FG can still be using it
+            DeferredRelease::Release(*OutResource);
             LOG_WARN("Release {}x{}, new one: {}x{}", bufDesc.Width, bufDesc.Height, inDesc.Width, inDesc.Height);
         }
         else
@@ -214,6 +215,16 @@ static bool CreateBufferResource(ID3D12Device* InDevice, ID3D12Resource* InResou
 
     LOG_DEBUG("Created new one: {}x{}", inDesc.Width, inDesc.Height);
     return true;
+}
+
+// Game's FG context is gone, nothing uses these until it's recreated
+static void ReleaseBuffers()
+{
+    for (size_t i = 0; i < BUFFER_COUNT; i++)
+    {
+        DeferredRelease::Release(_hudless[i]);
+        DeferredRelease::Release(_interpolation[i]);
+    }
 }
 
 static void ResourceBarrier(ID3D12GraphicsCommandList* InCommandList, ID3D12Resource* InResource,
@@ -430,28 +441,20 @@ ffxReturnCode_t ffxDestroyContext_Dx12FG(ffxContext* context, const ffxAllocatio
 
     if (State::Instance().currentFG != nullptr && (void*) scContext == *context)
     {
-        if (!Config::Instance()->FGPreserveSwapChain.value_or_default())
+        LOG_INFO("Destroying Swapchain Context: {:X}", (size_t) State::Instance().currentFG);
+        State::Instance().currentFG->ReleaseSwapchain(State::Instance().currentFG->Hwnd());
+
+        if (State::Instance().currentWrappedSwapchain != nullptr &&
+            State::Instance().currentSwapchainDesc.OutputWindow == State::Instance().currentFG->Hwnd())
         {
-            LOG_INFO("Destroying Swapchain Context: {:X}", (size_t) State::Instance().currentFG);
+            auto refCount = State::Instance().currentWrappedSwapchain->Release();
 
-            State::Instance().currentFG->ReleaseSwapchain(State::Instance().currentFG->Hwnd());
-
-            if (State::Instance().currentWrappedSwapchain != nullptr &&
-                State::Instance().currentSwapchainDesc.OutputWindow == State::Instance().currentFG->Hwnd())
+            while (refCount > 0 && refCount < 0xffffff00)
             {
-                auto refCount = State::Instance().currentWrappedSwapchain->Release();
-
-                while (refCount > 0 && refCount < 0xffffff00)
-                {
-                    refCount = State::Instance().currentWrappedSwapchain->Release();
-                }
-
-                State::Instance().currentWrappedSwapchain = nullptr;
+                refCount = State::Instance().currentWrappedSwapchain->Release();
             }
-        }
-        else
-        {
-            LOG_DEBUG("Preserving FGSwapChain!");
+
+            State::Instance().currentWrappedSwapchain = nullptr;
         }
 
         return FFX_API_RETURN_OK;
@@ -460,6 +463,7 @@ ffxReturnCode_t ffxDestroyContext_Dx12FG(ffxContext* context, const ffxAllocatio
     {
         LOG_INFO("Destroying FG Context: {:X}", (size_t) State::Instance().currentFG);
         State::Instance().currentFG->DestroyFGContext();
+        ReleaseBuffers();
         return FFX_API_RETURN_OK;
     }
 
@@ -524,9 +528,9 @@ ffxReturnCode_t ffxConfigure_Dx12FG(ffxContext* context, ffxConfigureDescHeader*
         LOG_DEBUG("FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION frameID: {}, enabled: {}, fIndex: {} ", cDesc->frameID,
                   cDesc->frameGenerationEnabled, fIndex);
 
-        s.FSRFGInputActive = cDesc->frameGenerationEnabled;
+        s.fsrfgInputActive = cDesc->frameGenerationEnabled;
 
-        if (cDesc->frameGenerationEnabled && !fg->IsActive() && Config::Instance()->FGEnabled.value_or_default())
+        if (cDesc->frameGenerationEnabled && !fg->IsActive() && Config::Instance()->IsFGEnabled())
         {
             if (!fg->IsPaused())
             {
@@ -887,11 +891,22 @@ ffxReturnCode_t ffxQuery_Dx12FG(ffxContext* context, ffxQueryDescHeader* desc)
 
         if (fg != nullptr)
         {
-            *cDesc->pOutCommandList = fg->GetUICommandList(fg->GetIndexWillBeDispatched());
-            LOG_DEBUG("Returning cmdList: {:X}", (size_t) *cDesc->pOutCommandList);
+            auto cmdList = fg->GetUICommandList(fg->GetIndexWillBeDispatched());
+            if (cmdList == nullptr)
+            {
+                *cDesc->pOutCommandList = nullptr;
+                LOG_ERROR("GetUICommandList failed");
+                return FFX_API_RETURN_ERROR_RUNTIME_ERROR;
+            }
+
+            *cDesc->pOutCommandList = cmdList;
+            LOG_DEBUG("Returning cmdList: {:X}", (size_t) cmdList);
+            return FFX_API_RETURN_OK;
         }
 
-        return FFX_API_RETURN_OK;
+        *cDesc->pOutCommandList = nullptr;
+        LOG_ERROR("No active frame-generation feature");
+        return FFX_API_RETURN_ERROR_RUNTIME_ERROR;
     }
     else if (desc->type == FFX_API_QUERY_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_INTERPOLATIONTEXTURE_DX12)
     {
@@ -1000,7 +1015,7 @@ ffxReturnCode_t ffxDispatch_Dx12FG(ffxContext* context, ffxDispatchDescHeader* d
 
                 if (cdDesc->presentColor.resource != nullptr &&
                     !Config::Instance()->FSRFGSkipDispatchForHudless.value_or_default() &&
-                    fg->GetResource(FG_ResourceType::HudlessColor) == nullptr)
+                    !fg->GetResource(FG_ResourceType::HudlessColor))
                 {
                     UINT width = cdDesc->generationRect.width;
                     UINT height = cdDesc->generationRect.height;
@@ -1095,7 +1110,7 @@ ffxReturnCode_t ffxDispatch_Dx12FG(ffxContext* context, ffxDispatchDescHeader* d
             if (Config::Instance()->FGDepthValidNow.value_or_default())
                 depth.validity = FG_ResourceValidity::ValidNow;
             else
-                depth.validity = FG_ResourceValidity::JustTrackCmdlist;
+                depth.validity = FG_ResourceValidity::UntilPresent;
 
             depth.width = cdDesc->renderSize.width; // cdDesc->depth.description.height;
             depth.frameIndex = fIndex;
@@ -1129,7 +1144,7 @@ ffxReturnCode_t ffxDispatch_Dx12FG(ffxContext* context, ffxDispatchDescHeader* d
             if (Config::Instance()->FGVelocityValidNow.value_or_default())
                 velocity.validity = FG_ResourceValidity::ValidNow;
             else
-                velocity.validity = FG_ResourceValidity::JustTrackCmdlist;
+                velocity.validity = FG_ResourceValidity::UntilPresent;
 
             velocity.width = width; // cdDesc->motionVectors.description.height;
             velocity.frameIndex = fIndex;
@@ -1187,7 +1202,7 @@ ffxReturnCode_t ffxDispatch_Dx12FG(ffxContext* context, ffxDispatchDescHeader* d
             if (Config::Instance()->FGDepthValidNow.value_or_default())
                 depth.validity = FG_ResourceValidity::ValidNow;
             else
-                depth.validity = FG_ResourceValidity::JustTrackCmdlist;
+                depth.validity = FG_ResourceValidity::UntilPresent;
 
             depth.width = cdDesc->renderSize.width; // cdDesc->depth.description.height;
             depth.frameIndex = fIndex;
@@ -1221,7 +1236,7 @@ ffxReturnCode_t ffxDispatch_Dx12FG(ffxContext* context, ffxDispatchDescHeader* d
             if (Config::Instance()->FGVelocityValidNow.value_or_default())
                 velocity.validity = FG_ResourceValidity::ValidNow;
             else
-                velocity.validity = FG_ResourceValidity::JustTrackCmdlist;
+                velocity.validity = FG_ResourceValidity::UntilPresent;
 
             velocity.width = width; // cdDesc->motionVectors.description.height;
             velocity.frameIndex = fIndex;
@@ -1342,7 +1357,7 @@ void ffxPresentCallback()
 
         if (result == FFX_API_RETURN_OK)
         {
-            if (fg->GetResource(FG_ResourceType::HudlessColor, fIndex) == nullptr)
+            if (!fg->GetResource(FG_ResourceType::HudlessColor, fIndex))
             {
                 auto hDesc = _hudless[fIndex]->GetDesc();
                 Dx12Resource hudless {};
@@ -1440,7 +1455,7 @@ void ffxPresentCallback()
 
         if (result == FFX_API_RETURN_OK)
         {
-            if (fg->GetResource(FG_ResourceType::HudlessColor, fIndex) == nullptr)
+            if (!fg->GetResource(FG_ResourceType::HudlessColor, fIndex))
             {
                 auto hDesc = _hudless[fIndex]->GetDesc();
                 Dx12Resource hudless {};

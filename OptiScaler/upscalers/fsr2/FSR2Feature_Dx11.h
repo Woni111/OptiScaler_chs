@@ -40,11 +40,21 @@ class FSR2FeatureDx11 : public FSR2Feature, public IFeature_Dx11
     FSR2FeatureDx11(unsigned int InHandleId, NVSDK_NGX_Parameter* InParameters);
 
     // Inherited via IFeature_Dx11
-    bool Init(ID3D11Device* InDevice, ID3D11DeviceContext* InContext, NVSDK_NGX_Parameter* InParameters) override;
-    bool Evaluate(ID3D11DeviceContext* DeviceContext, NVSDK_NGX_Parameter* InParameters) override;
+    bool InitInternal(ID3D11DeviceContext* InContext, NVSDK_NGX_Parameter* InParameters) override;
+    bool EvaluateInternal(ID3D11DeviceContext* DeviceContext, NVSDK_NGX_Parameter* InParameters) override;
 
     feature_version Version() override { return FSR2Feature::Version(); }
-    std::string Name() const override { return FSR2Feature::Name(); }
+    Upscaler GetUpscalerType() const final { return Upscaler::FSR22; }
+    API Api() const override { return IFeature_Dx11::Api(); }
+    bool CallsUpscalerEndByItself() override { return IFeature_Dx11::CallsUpscalerEndByItself(); }
+    std::optional<double> ReadUpscalerTime(void* commandQueue) override
+    {
+        return IFeature_Dx11::ReadUpscalerTime(commandQueue);
+    };
+    void ReadDetailedGpuTimes(void* commandQueue, std::vector<DetailedGpuTime>& detailedGpuTimes) override
+    {
+        return IFeature_Dx11::ReadDetailedGpuTimes(commandQueue, detailedGpuTimes);
+    };
 
     bool IsWithDx12() override { return false; }
 

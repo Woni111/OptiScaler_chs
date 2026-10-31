@@ -19,22 +19,6 @@ void DLSSFeature::ProcessEvaluateParams(NVSDK_NGX_Parameter* InParameters)
     else
     {
         InParameters->Set(NVSDK_NGX_Parameter_Sharpness, 0.0f);
-
-        UINT hwDepth = 10;
-        if (InParameters->Get("DLSS.Use.HW.Depth", &hwDepth) == NVSDK_NGX_Result_Success)
-        {
-            LOG_DEBUG("DLSS.Use.HW.Depth: {}", hwDepth);
-
-            if (hwDepth == 0)
-                Config::Instance()->DADepthIsLinear.set_volatile_value(true);
-            else
-                Config::Instance()->DADepthIsLinear.set_volatile_value(false);
-        }
-        else
-        {
-            if (Config::Instance()->DADepthIsLinear.value_for_config_ignore_default() == std::nullopt)
-                Config::Instance()->DADepthIsLinear.set_volatile_value(false);
-        }
     }
 
     // Read render resolution
@@ -279,9 +263,18 @@ void DLSSFeature::ProcessInitParams(NVSDK_NGX_Parameter* InParameters)
     LOG_FUNC_RESULT(0);
 }
 
-void DLSSFeature::ReadVersion()
+void DLSSFeature::ReadVersion(const std::wstring& customDll)
 {
     LOG_FUNC();
+
+    if (!customDll.empty())
+    {
+        if (auto version = Util::GetFileVersionString(customDll); !version.empty())
+            _version.parse_version(version.c_str());
+
+        LOG_INFO("Custom DLSS v{0}.{1}.{2} loaded.", _version.major, _version.minor, _version.patch);
+        return;
+    }
 
     std::vector<std::string> possibleDlls;
 

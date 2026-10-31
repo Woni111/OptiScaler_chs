@@ -17,11 +17,29 @@ class NtdllHooks
   private:
     inline static std::mutex hookMutex;
 
+    inline static NtdllProxy::PFN_RtlGetVersion o_RtlGetVersion = nullptr;
     inline static NtdllProxy::PFN_NtLoadDll o_NtLoadDll = nullptr;
     inline static NtdllProxy::PFN_LdrLoadDll o_LdrLoadDll = nullptr;
     inline static NtdllProxy::PFN_LdrUnloadDll o_LdrUnloadDll = nullptr;
 
-    inline static bool _overlayMethodsCalled = false;
+    static NTSTATUS NTAPI hkRtlGetVersion(PRTL_OSVERSIONINFOW lpVersionInformation)
+    {
+        if (lpVersionInformation == nullptr)
+            return STATUS_INVALID_PARAMETER;
+
+        auto result = o_RtlGetVersion(lpVersionInformation);
+
+        if (lpVersionInformation->dwMajorVersion <= 10 && lpVersionInformation->dwBuildNumber < 21996 &&
+            State::Instance().activeFgOutput == FGOutput::FSRFG && State::Instance().isRunningOnLinux &&
+            Util::GetCallerModule(_ReturnAddress()) ==
+                KernelBaseProxy::GetModuleHandleW_()(L"amd_fidelityfx_framegeneration_dx12.dll"))
+        {
+            lpVersionInformation->dwMajorVersion = 10;
+            lpVersionInformation->dwBuildNumber = 21996;
+        }
+
+        return result;
+    }
 
     static NTSTATUS NTAPI hkLdrLoadDll(PWSTR PathToFile, PULONG Flags, PUNICODE_STRING ModuleFileName,
                                        PHANDLE ModuleHandle)
@@ -68,14 +86,19 @@ class NtdllHooks
 
             if (moduleHandle != nullptr)
             {
-
                 LOG_TRACE("{}, caller: {}", wstring_to_string(name.data()), Util::WhoIsTheCaller(_ReturnAddress()));
                 *ModuleHandle = (HANDLE) moduleHandle;
+                LibraryLoadHooks::AfterLoadLibrary(moduleHandle);
                 return (NTSTATUS) 0x00000000L;
             }
         }
 
-        return o_LdrLoadDll(PathToFile, Flags, ModuleFileName, ModuleHandle);
+        auto result = o_LdrLoadDll(PathToFile, Flags, ModuleFileName, ModuleHandle);
+
+        if (NT_SUCCESS(result))
+            LibraryLoadHooks::AfterLoadLibrary((HMODULE) *ModuleHandle);
+
+        return result;
     }
 
     static NTSTATUS NTAPI hkNtLoadDll(PUNICODE_STRING PathToFile, PULONG Flags, PUNICODE_STRING ModuleFileName,
@@ -156,9 +179,14 @@ class NtdllHooks
                 return result.value();
         }
 
-        return o_LdrUnloadDll(lpLibrary);
+        auto unloadResult = o_LdrUnloadDll(lpLibrary);
+
+        LibraryLoadHooks::AfterFreeLibrary(lpLibrary);
+
+        return unloadResult;
     }
 
+    VALIDATE_MEMBER_HOOK(hkRtlGetVersion, NtdllProxy::PFN_RtlGetVersion)
     VALIDATE_MEMBER_HOOK(hkNtLoadDll, NtdllProxy::PFN_NtLoadDll)
     VALIDATE_MEMBER_HOOK(hkLdrLoadDll, NtdllProxy::PFN_LdrLoadDll)
     VALIDATE_MEMBER_HOOK(hkLdrUnloadDll, NtdllProxy::PFN_LdrUnloadDll)
@@ -175,6 +203,9 @@ class NtdllHooks
 
         if (NtdllProxy::Module() == nullptr)
             return;
+
+        if (o_RtlGetVersion == nullptr)
+            o_RtlGetVersion = NtdllProxy::Hook_RtlGetVersion(hkRtlGetVersion);
 
         // if (o_NtLoadDll == nullptr)
         //     o_NtLoadDll = NtdllProxy::Hook_NtLoadDll(hkNtLoadDll);
