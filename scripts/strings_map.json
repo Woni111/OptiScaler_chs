@@ -1454,5 +1454,6 @@
  "%s | FPS: %6.1f, Avg: %6.1f %s": "UI_s_FPS_6_1f_Avg_6_1f_s",
  "D3D11 %s| %s %d.%d.%d": "UI_D3D11_s_s_d_d_d",
  "Vulkan %s| %s %d.%d.%d": "UI_Vulkan_s_s_d_d_d",
- "Apply##2": "UI_Apply_2"
+ "Apply##2": "UI_Apply_2",
+ "Lemon zest": "UI_Lemon_zest"
 }

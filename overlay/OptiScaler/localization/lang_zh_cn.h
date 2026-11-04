@@ -1636,4 +1636,5 @@ inline void InitChineseSimplifiedTable(std::unordered_map<int, const char*>& tab
     table[static_cast<int>(LK::UI_D3D11_s_s_d_d_d)] = "D3D11 %s| %s %d.%d.%d";
     table[static_cast<int>(LK::UI_Vulkan_s_s_d_d_d)] = "Vulkan %s| %s %d.%d.%d";
     table[static_cast<int>(LK::UI_Apply_2)] = "Apply##2";
+    table[static_cast<int>(LK::UI_Lemon_zest)] = "柠檬皮屑";
 }
