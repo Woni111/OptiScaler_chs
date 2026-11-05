@@ -1455,5 +1455,7 @@
  "D3D11 %s| %s %d.%d.%d": "UI_D3D11_s_s_d_d_d",
  "Vulkan %s| %s %d.%d.%d": "UI_Vulkan_s_s_d_d_d",
  "Apply##2": "UI_Apply_2",
- "Lemon zest": "UI_Lemon_zest"
+ "Lemon zest": "UI_Lemon_zest",
+ "If UI is too bright, disable this option": "UI_If_UI_is_too_bright_disable_this_option",
+ "Lowers sharpness at high contrast areas.": "UI_Lowers_sharpness_at_high_contrast_areas"
 }

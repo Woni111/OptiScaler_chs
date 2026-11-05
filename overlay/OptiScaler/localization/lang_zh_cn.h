@@ -1637,4 +1637,6 @@ inline void InitChineseSimplifiedTable(std::unordered_map<int, const char*>& tab
     table[static_cast<int>(LK::UI_Vulkan_s_s_d_d_d)] = "Vulkan %s| %s %d.%d.%d";
     table[static_cast<int>(LK::UI_Apply_2)] = "Apply##2";
     table[static_cast<int>(LK::UI_Lemon_zest)] = "柠檬皮屑";
+    table[static_cast<int>(LK::UI_If_UI_is_too_bright_disable_this_option)] = "如果用户界面（UI）过亮，请禁用此选项";
+    table[static_cast<int>(LK::UI_Lowers_sharpness_at_high_contrast_areas)] = "降低高对比度区域的锐度。";
 }

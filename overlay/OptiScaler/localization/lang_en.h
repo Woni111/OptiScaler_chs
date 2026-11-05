@@ -1625,4 +1625,6 @@ inline void InitEnglishTable(std::unordered_map<int, const char*>& table) {
     table[static_cast<int>(LK::UI_Vulkan_s_s_d_d_d)] = "Vulkan %s| %s %d.%d.%d";
     table[static_cast<int>(LK::UI_Apply_2)] = "Apply##2";
     table[static_cast<int>(LK::UI_Lemon_zest)] = "Lemon zest";
+    table[static_cast<int>(LK::UI_If_UI_is_too_bright_disable_this_option)] = "If UI is too bright, disable this option";
+    table[static_cast<int>(LK::UI_Lowers_sharpness_at_high_contrast_areas)] = "Lowers sharpness at high contrast areas.";
 }

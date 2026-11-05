@@ -1,1 +1,4 @@
-[]
+[
+ "If UI is too bright, disable this option",
+ "Lowers sharpness at high contrast areas."
+]

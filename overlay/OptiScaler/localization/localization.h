@@ -1619,6 +1619,8 @@ enum class LK {
     UI_Vulkan_s_s_d_d_d,
     UI_Apply_2,
     UI_Lemon_zest,
+    UI_If_UI_is_too_bright_disable_this_option,
+    UI_Lowers_sharpness_at_high_contrast_areas,
     COUNT
 };
 
